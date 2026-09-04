@@ -27,9 +27,23 @@ Extension สำหรับเชื่อมต่อ **Freebuff (Codebuff)** 
 - `/freebuff rotate` : บังคับสลับไปใช้บัญชีถัดไปใน Pool ทันที
 - `/model` : สลับโมเดลที่ต้องการใช้งาน (เช่น DeepSeek V4 Flash 07/31, MiMo 2.5, Solar Pro 4)
 
+- **5-Layer Anti-Ban Protection (เกราะป้องกันบัญชี 5 ชั้น):**
+  1. **Proactive Quota Guard:** ตรวจจับโควต้าที่เหลือและสลับบัญชีล่วงหน้าก่อนชนเพดาน 429
+  2. **Humanized Jitter & Pacing:** หน่วงเวลาแบบสุ่ม 250ms - 550ms เมื่อมีคำขอถี่ๆ ติดกัน เลียนแบบการพิมพ์ของมนุษย์
+  3. **Graceful Session Cleanup:** ส่ง `DELETE` คืน Session ห้องรออัตโนมัติเมื่อปิด pi หรือสลับบัญชี
+  4. **Circuit Breaker:** พักบัญชีทันที 60 นาทีหากพบความผิดปกติ ไม่ยิงกระหน่ำซ้ำบัญชีเดิม
+  5. **HTTP / WARP Proxy Support:** รองรับการมุด IP ผ่าน `FREEBUFF_HTTP_PROXY`
+
 ---
 
-## การจัดการ Token และอัปเดต (Updater Script)
+## Configuration (ตัวเลือกเสริม)
+
+สามารถกำหนด Environment Variables เพิ่มเติมได้:
+
+- `FREEBUFF_HTTP_PROXY`: URL ของ Proxy (เช่น `http://127.0.0.1:7890` หรือ Cloudflare WARP)
+- `FREEBUFF_AUTH_TOKENS`: รายการ Auth Token หลายบัญชีคั่นด้วยจุลภาค (เช่น `token1,token2`)
+
+---
 
 ในโปรเจกต์นี้มีสคริปต์ `update.sh` สำหรับจัดการบัญชีและอัปเดต:
 

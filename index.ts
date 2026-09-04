@@ -39,6 +39,32 @@ const MODEL_DISPLAY_NAMES: Record<string, string> = {
   "z-ai/glm-5.3-flash": "GLM 5.3 Flash",
 };
 
+let cachedDispatcher: any = null;
+let dispatcherChecked = false;
+
+function getFetchDispatcher() {
+  if (dispatcherChecked) return cachedDispatcher;
+  dispatcherChecked = true;
+  const proxyUrl =
+    process.env.FREEBUFF_HTTP_PROXY ||
+    process.env.HTTP_PROXY ||
+    process.env.HTTPS_PROXY;
+
+  if (proxyUrl) {
+    try {
+      const { ProxyAgent } = require("undici");
+      cachedDispatcher = new ProxyAgent(proxyUrl);
+    } catch {}
+  }
+  return cachedDispatcher;
+}
+
+function safeFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const dispatcher = getFetchDispatcher();
+  const options = dispatcher ? { ...(init || {}), dispatcher } : init;
+  return fetch(input, options as any);
+}
+
 function saveAuthToken(newToken: string, accountKey?: string): string {
   const credPath = path.join(os.homedir(), ".config", "manicode", "credentials.json");
   fs.mkdirSync(path.dirname(credPath), { recursive: true });
@@ -292,7 +318,7 @@ class CodebuffClient {
 
   async deleteSession(): Promise<void> {
     try {
-      await fetch(`${CODEBUFF_API_URL}/api/v1/freebuff/session`, {
+      await safeFetch(`${CODEBUFF_API_URL}/api/v1/freebuff/session`, {
         method: "DELETE",
         headers: {
           Authorization: `Bearer ${this.token}`,
@@ -318,7 +344,7 @@ class CodebuffClient {
       await this.deleteSession();
     }
 
-    const res = await fetch(`${CODEBUFF_API_URL}/api/v1/freebuff/session`, {
+    const res = await safeFetch(`${CODEBUFF_API_URL}/api/v1/freebuff/session`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${this.token}`,
@@ -362,7 +388,7 @@ class CodebuffClient {
   }
 
   async startRun(agentId: string): Promise<string> {
-    const res = await fetch(`${CODEBUFF_API_URL}/api/v1/agent-runs`, {
+    const res = await safeFetch(`${CODEBUFF_API_URL}/api/v1/agent-runs`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${this.token}`,
@@ -383,7 +409,7 @@ class CodebuffClient {
 
   async finishRun(runId: string): Promise<void> {
     try {
-      await fetch(`${CODEBUFF_API_URL}/api/v1/agent-runs`, {
+      await safeFetch(`${CODEBUFF_API_URL}/api/v1/agent-runs`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${this.token}`,
@@ -415,6 +441,21 @@ interface TokenState {
   lastUsed: number;
   cooldownUntil: number;
   isBanned: boolean;
+}
+
+class RequestPacer {
+  private lastRequestTime = 0;
+
+  async pace(): Promise<void> {
+    const now = Date.now();
+    const elapsed = now - this.lastRequestTime;
+    const minGap = 350;
+    if (this.lastRequestTime > 0 && elapsed < minGap) {
+      const jitter = minGap - elapsed + Math.floor(Math.random() * 200 + 100);
+      await new Promise((r) => setTimeout(r, jitter));
+    }
+    this.lastRequestTime = Date.now();
+  }
 }
 
 class TokenPool {
@@ -479,6 +520,37 @@ class TokenPool {
       current = this.pool[this.activeIndex];
     }
 
+    // Proactive Quota Guard: Check if current token is near its limit
+    const currentSession = current.client.getSessionCache();
+    const currentRL = currentSession?.rateLimit;
+    const isNearLimit =
+      currentRL &&
+      typeof currentRL.limit === "number" &&
+      typeof currentRL.recentCount === "number" &&
+      currentRL.recentCount >= currentRL.limit - 0.5;
+
+    if (isNearLimit && this.pool.length > 1) {
+      for (let i = 1; i <= this.pool.length; i++) {
+        const nextIdx = (this.activeIndex + i) % this.pool.length;
+        const candidate = this.pool[nextIdx];
+        const candSession = candidate.client.getSessionCache();
+        const candRL = candSession?.rateLimit;
+        const candNear =
+          candRL &&
+          typeof candRL.limit === "number" &&
+          typeof candRL.recentCount === "number" &&
+          candRL.recentCount >= candRL.limit - 0.5;
+
+        if (!candidate.isBanned && candidate.cooldownUntil <= now && !candNear) {
+          this.activeIndex = nextIdx;
+          this.activeStartedAt = now;
+          candidate.requestCount = 0;
+          current = candidate;
+          break;
+        }
+      }
+    }
+
     if (current.isBanned || current.cooldownUntil > now) {
       const healthyIdx = this.pool.findIndex(
         (p) => !p.isBanned && p.cooldownUntil <= now
@@ -536,6 +608,11 @@ class TokenPool {
     }
   }
 
+  async cleanupAll(): Promise<void> {
+    const promises = this.pool.map((p) => p.client.deleteSession());
+    await Promise.allSettled(promises);
+  }
+
   getPoolStatus() {
     const now = Date.now();
     return this.pool.map((p, idx) => ({
@@ -586,13 +663,14 @@ export default async function (pi: ExtensionAPI) {
   }
 
   const pool = new TokenPool(authTokens);
+  const pacer = new RequestPacer();
   const primaryEntry = pool.getActive();
 
   // Discover available models from primary session or use defaults
   let availableModels = DEFAULT_MODELS;
   if (primaryEntry) {
     try {
-      const sRes = await fetch(`${CODEBUFF_API_URL}/api/v1/freebuff/session`, {
+      const sRes = await safeFetch(`${CODEBUFF_API_URL}/api/v1/freebuff/session`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${primaryEntry.state.token}`,
@@ -699,8 +777,11 @@ export default async function (pi: ExtensionAPI) {
               freebuff_instance_id: instanceId,
             };
 
-            // 4. Forward to Codebuff
-            upstreamRes = await fetch(`${CODEBUFF_API_URL}/api/v1/chat/completions`, {
+            // 4. Humanized Jitter & Pacing
+            await pacer.pace();
+
+            // 5. Forward to Codebuff
+            upstreamRes = await safeFetch(`${CODEBUFF_API_URL}/api/v1/chat/completions`, {
               method: "POST",
               headers: {
                 Authorization: `Bearer ${currentToken}`,
@@ -767,6 +848,34 @@ export default async function (pi: ExtensionAPI) {
 
           if (!upstreamRes) {
             throw new Error("No response from upstream Codebuff");
+          }
+
+          if (!upstreamRes.ok) {
+            const errText = await upstreamRes.text();
+            let errMsg = errText;
+            try {
+              const errObj = JSON.parse(errText);
+              errMsg = errObj.message || errObj.error || errText;
+              if (errObj.status === "banned") {
+                errMsg =
+                  "This Freebuff account has been suspended. Please run `/freebuff` or `./update.sh add <TOKEN>` to add a new token.";
+              } else if (errObj.status === "rate_limited") {
+                errMsg =
+                  "Daily quota reached for this account. Run `/freebuff` to add another account to the pool.";
+              }
+            } catch {}
+
+            res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                error: { message: `Freebuff error (${upstreamRes.status}): ${errMsg}` },
+              })
+            );
+            if (activeRunInfo) {
+              await activeRunInfo.client.finishRun(activeRunInfo.runId);
+              activeRunInfo = null;
+            }
+            return;
           }
 
           if (!isStream) {
@@ -937,9 +1046,12 @@ export default async function (pi: ExtensionAPI) {
   const address = server.address() as { port: number };
   const proxyBaseUrl = `http://127.0.0.1:${address.port}/v1`;
 
-  // Close server on session shutdown
-  pi.on("session_shutdown", () => {
-    server.close();
+  // Close server and cleanup sessions on session shutdown
+  pi.on("session_shutdown", async () => {
+    try {
+      server.close();
+      await pool.cleanupAll();
+    } catch {}
   });
 
   // Register provider in pi

@@ -1,86 +1,77 @@
-# Plan: Embedded Native Freebuff Extension for pi CLI (No Docker)
+# Plan: Anti-Ban & Stealth Protection Architecture for pi-freebuff
 
 ## Context
-ผู้ใช้ต้องการใช้งาน Freebuff บน **pi CLI** โดยไม่ต้องการรัน Docker หรือติดตั้ง Go เพิ่มเติม เนื่องจาก Docker เปลืองทรัพยากร และต้องเปิดโปรเซสภายนอกค้างไว้ 
+ในการใช้งาน Freebuff API มีความเสี่ยงที่บัญชีอาจถูกระงับ (`403 {"status":"banned"}`) หากระบบ Anti-Abuse ของ Codebuff ตรวจพบพฤติกรรมผิดปกติ เช่น:
+1. การยิงคำขอเร็วเกินไปหรือต่อเนื่องโดยไม่มีช่วงหน่วงเวลา (Bot-like burst traffic)
+2. การยิงจนทะลุโควต้าประจำวัน (`429 rate_limited`) ซ้ำๆ จนระบบมองว่าเป็นสแปม
+3. การทิ้ง Session ค้างไว้โดยไม่ปิดอย่างถูกต้อง ทำให้เกิด `session_superseded`
+4. การที่หลายบัญชียิงพร้อมกันจาก IP เดิมด้วยรูปแบบที่ผิดธรรมชาติ
 
-จากการตรวจสอบเชิงลึก:
-- เซิร์ฟเวอร์ของ Freebuff (`www.codebuff.com`) เป็น OpenAI-compatible SSE stream อยู่แล้ว
-- สิ่งที่ต้องการเพิ่มเติมมีเพียง:
-  1. การยืนยันตัวตนด้วย Auth Token (ซึ่งมีอยู่ในเครื่องที่ `~/.config/manicode/credentials.json` อยู่แล้ว)
-  2. การขอ Waiting Room Session (`/api/v1/freebuff/session`)
-  3. การเปิด/ปิด Agent Run (`/api/v1/agent-runs`)
-  4. การใส่ System Prompt Marker และ Metadata ที่จำเป็น
-- เราสามารถทำสิ่งเหล่านี้ทั้งหมดผ่าน **In-Process Lightweight Adapter** ใน Node.js (ภาษาที่ pi ใช้อยู่แล้ว) ฝังใน Extension ตัวเดียวจบ
+เป้าหมายคือการสร้าง **5 ชั้นเกราะป้องกัน (5-Layer Anti-Ban Shield)** เข้าไปใน `index.ts` เพื่อให้การใช้งานผ่าน pi CLI ปลอดภัยและดูเหมือนการใช้งานผ่าน Freebuff CLI ตัวจริงมากที่สุด
 
 ---
 
-## Approach
+## Approach (ระบบป้องกัน 5 ชั้น)
 
-สถาปัตยกรรมแบบ **Embedded Native Extension**:
-```
-┌────────────────────────────────────────────────────────┐
-│                        pi CLI                          │
-│                                                        │
-│  [pi Agent Engine] ──(HTTP)──> [In-Process Adapter]   │
-│  (openai-completions)           (127.0.0.1:random)     │
-│                                        │               │
-└────────────────────────────────────────┼───────────────┘
-                                         ▼ (HTTPS)
-                              [https://www.codebuff.com]
-```
+### 1. Proactive Quota Guard (สลับบัญชีก่อนชนเพดาน)
+- เซิร์ฟเวอร์ Codebuff ส่งข้อมูลโควต้ากลับมาใน Session ทุกครั้ง (`recentCount` และ `limit`)
+- **การทำงาน:** เมื่อโควต้าบัญชีปัจจุบันใช้ไปถึง 90% (เช่น `recentCount >= limit - 0.5`) ระบบจะสลับไปบัญชีถัดไปใน Pool ล่วงหน้าทันที **โดยไม่ต้องรอให้เจอ 429 Rate Limit** ซึ่งเป็นตัวกระตุ้นให้เซิร์ฟเวอร์เพ่งเล็งบัญชี
 
-1. **Auto-Auth Detection:** ดึง Token อัตโนมัติจาก `~/.config/manicode/credentials.json` หรือ Environment Variable `FREEBUFF_AUTH_TOKEN` (Zero-Config สำหรับผู้ที่เคยใช้ freebuff CLI)
-2. **Ephemeral In-Process Server:** เมื่อ pi เริ่มทำงาน Extension จะเปิด HTTP server เล็กๆ บนพอร์ตสุ่ม `127.0.0.1:0` เพื่อรอรับ request จาก pi เอง
-3. **Session & Run Lifecycle:**
-   - ขอ `instanceId` จาก `/api/v1/freebuff/session` (แคชไว้จนกว่าจะหมดอายุ)
-   - สั่ง `START` run ก่อนส่ง completion และสั่ง `FINISH` เมื่อ stream จบ
-   - เสียบ System Prompt Marker ("You are Buffy...") และ `codebuff_metadata`
-   - Pipe SSE Stream กลับเข้า pi CLI โดยตรง
-4. **Clean Teardown:** ปิด server เมื่อ pi ปิดการทำงาน ไม่มีพอร์ตค้างในเครื่อง
-5. **Command `/freebuff`:** ดูรายชื่อโมเดล โควต้าคงเหลือ (Daily Limit / Remaining) และสถานะคิวแบบสดๆ
+### 2. Humanized Jitter & Request Pacing (หน่วงเวลาสุ่มเสมือนมนุษย์)
+- เมื่อมี Tool Loops ติดต่อกัน (เช่น bash -> read -> edit) การยิงติดๆ กันใน 0-50ms จะถูกตรวจจับได้ง่าย
+- **การทำงาน:** เพิ่ม Micro-Jitter หน่วงเวลาแบบสุ่ม 250ms - 550ms ระหว่าง Request ถี่ๆ เพื่อเลียนแบบพฤติกรรมมนุษย์
+
+### 3. Graceful Session Lifecycle Management (เก็บกวาด Session สะอาดหมดจด)
+- เมื่อ pi ปิดการทำงาน (`session_shutdown`) หรือเมื่อมีการสลับบัญชี:
+- **การทำงาน:** ส่งคำสั่ง `DELETE /api/v1/freebuff/session` เสมอ เพื่อคืนโควต้าห้องรอ ไม่ทิ้ง session ร้างไว้บนคลาวด์จนเกิด `session_superseded` ในรอบถัดไป
+
+### 4. Circuit Breaker & Progressive Cooldown (ตัดวงจรเมื่อบัญชีสะดุด)
+- หากบัญชีใดเริ่มมีสัญญาณเตือน (เช่น เจอ 429 หรือ Waiting Room Queued):
+- **การทำงาน:** พักบัญชีนั้นทันที 60 นาที (Cooldown) และสลับไปบัญชีอื่นทันที **ห้ามยิงกระหน่ำซ้ำบัญชีเดิมเด็ดขาด** เพื่อป้องกันไม่ให้ความผิดพลาดธรรมดาบานปลายกลายเป็น Hard Ban
+
+### 5. HTTP Proxy Support (รองรับการมุด IP / Cloudflare WARP)
+- เพิ่มตัวเลือก `FREEBUFF_HTTP_PROXY` / `HTTP_PROXY`:
+- **การทำงาน:** หากผู้ใช้ระบุ Proxy ตัว Extension จะส่งคำขอผ่าน Proxy Agent (ใช้ `undici.ProxyAgent` หรือ `node:https`) เพื่อให้ผู้ใช้สามารถเปลี่ยน IP หรือใช้ WARP ได้อย่างอิสระ
 
 ---
 
 ## Files to Modify
-- `index.ts`: เขียนตัว In-Process Adapter, Session/Run Manager และลงทะเบียน Provider ใน pi
-- `package.json`: อัปเดต metadata ของ package สำหรับแจกจ่าย
-- `README.md`: อัปเดตวิธีใช้งานแบบไม่ต้องใช้ Docker
+- `index.ts`:
+  - เพิ่ม `ProactiveQuotaGuard` ตรวจสอบ `recentCount` ใน Session
+  - เพิ่ม `HumanizedJitter` (delay สุ่มระหว่าง request)
+  - ปรับปรุง `cleanSessionOnExit` ใน event `session_shutdown`
+  - เพิ่มการรองรับ Proxy Dispatcher สำหรับ outbound fetch
+- `README.md`:
+  - อัปเดตคำแนะนำและตัวเลือก Environment Variables เช่น `FREEBUFF_HTTP_PROXY`
 
 ---
 
 ## Reuse
-- **Node.js Stdlib:** `node:http`, `node:fs`, `node:path`, `node:os`, `node:crypto` (ไม่มี third-party dependencies)
-- **Official Credentials:** ดึง token จาก `~/.config/manicode/credentials.json` ที่มีอยู่แล้วในเครื่อง
-- **pi API:** `pi.registerProvider()`, `pi.registerCommand()`, `pi.on("session_shutdown")`
+- Node.js built-in `node:http`, `node:https`, `crypto`
+- Vercel AI SDK request signature ที่จำลองอย่างสมบูรณ์ใน `index.ts`
+- Token Pool ที่สร้างไว้แล้ว
 
 ---
 
 ## Steps
 
-- [ ] **Step 1: Auth Token & Config Loader**
-  - อ่าน `authToken` จาก `~/.config/manicode/credentials.json`
-  - รองรับ fallback ผ่าน `FREEBUFF_AUTH_TOKEN`
-- [ ] **Step 2: Codebuff Session & Run Manager**
-  - ฟังก์ชันจัดการ Session (`/api/v1/freebuff/session`) รองรับตรวจเช็ค expiry
-  - ฟังก์ชันสร้างและจบ Agent Run (`/api/v1/agent-runs`)
-  - แมปโมเดลกับ Agent ID ที่ถูกต้อง (`deepseek/deepseek-v4-flash`, `deepseek/deepseek-v4-pro`, `mimo/mimo-v2.5`, `minimax/minimax-m3`, `upstage/solar-pro4`)
-- [ ] **Step 3: Lightweight In-Process HTTP Proxy**
-  - สร้าง local HTTP server ด้วย `node:http` บน `127.0.0.1:0`
-  - ดักจับ `/v1/chat/completions` เพื่อ inject metadata และ pipe SSE stream
-  - ปิด server ใน event `session_shutdown`
-- [ ] **Step 4: Dynamic Model Registration & Command**
-  - ลงทะเบียน Provider `freebuff` ใน pi ชี้ไปที่ local ephemeral port
-  - เพิ่มคำสั่ง `/freebuff` ใน TUI เพื่อเช็คโควต้าและสลับโมเดล
-- [ ] **Step 5: Documentation & Packaging**
-  - ปรับปรุง `README.md` ให้เป็นคู่มือแบบไม่ต้องใช้ Docker
+- [ ] **Step 1: Proactive Quota Guard**
+  - ดึงค่า `rateLimit` จาก session response (`recentCount`, `limit`)
+  - สร้างเงื่อนไขตรวจสอบก่อนส่งคำขอ: ถ้าบัญชีปัจจุบันใกล้เต็มเพดาน ให้เรียก `pool.rotateNext()` สลับไปบัญชีสำรองทันที
+- [ ] **Step 2: Humanized Jitter & Micro-Delays**
+  - คำนวณช่วงเวลาระหว่าง request ล่าสุด ถ้าเร็วกว่า 500ms ให้สุ่ม delay (250-550ms) ก่อนยิง upstream
+- [ ] **Step 3: Comprehensive Session Cleanup**
+  - เพิ่มฟังก์ชันเคลียร์ session ของทุกบัญชีใน pool เมื่อ pi ส่งสัญญาณ `session_shutdown` หรือ `process.on('exit')`
+- [ ] **Step 4: Circuit Breaker & Safety Logging**
+  - ปรับปรุงการจัดการ Error เมื่อเจอสัญญาณ 429/428 ให้ติด cooldown ทันทีและแจ้งเตือนผู้ใช้ใน TUI
+- [ ] **Step 5: Upstream Proxy Support**
+  - รองรับการตั้งค่า `FREEBUFF_HTTP_PROXY` ผ่าน custom fetch dispatcher
+- [ ] **Step 6: Documentation & Verification**
+  - อัปเดต `README.md` และทดสอบ offline verification
 
 ---
 
 ## Verification
-1. **การค้นพบโมเดล:** รัน `pi -e ./index.ts --list-models | grep freebuff` เพื่อตรวจสอบว่าโมเดลแสดงครบถ้วน
-2. **การสนทนาจริง (Streaming Check):** รันคำสั่งทดสอบ:
-   ```bash
-   pi -e ./index.ts --model freebuff/deepseek/deepseek-v4-flash -p "ตอบคำว่า PONYTAIL"
-   ```
-   และตรวจสอบว่าคำตอบ Stream กลับมาสมบูรณ์โดยไม่ต้องเปิดโปรแกรมภายนอก
-3. **คำสั่งใน TUI:** ทดสอบเรียก `/freebuff` ใน session เพื่อดูโควต้าและสถานะคิว
+1. ตรวจสอบ Offline ด้วย unit checks: ตรวจสอบว่า `ProactiveQuotaGuard` สลับบัญชีเมื่อ `recentCount >= limit - 0.5`
+2. ทดสอบ Jitter Delay: จำลองยิงคำขอ 2 ครั้งติดกัน ตรวจสอบว่ามี delay เสริมเข้ามาตามที่กำหนด
+3. ทดสอบการปิด Session สะอาดเมื่อ pi ออกจากโปรแกรม
