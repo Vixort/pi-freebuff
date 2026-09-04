@@ -57,7 +57,165 @@ function getBuffyMarker(model: string): string {
 You are running on the ${model} model.
 You are the AI agent behind Freebuff, a tool where users can chat with you to code with AI for free. See freebuff.com for more information about the product.
 
-Always reply directly in natural language markdown text. Do not emit DSML or XML tool invocation syntax.`;
+To call any tool, use the standard DSML tool format:
+<｜DSML｜tool_calls>
+<｜DSML｜invoke name="tool_name">
+<｜DSML｜parameter name="param_name" string="true">value</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>`;
+}
+
+class DSMLStreamTransformer {
+  private inDSML = false;
+  private dsmlBuffer = "";
+  private carry = "";
+
+  constructor(
+    private res: http.ServerResponse,
+    private id: string,
+    private model: string
+  ) {}
+
+  feedReasoning(reasoning: string) {
+    if (!reasoning) return;
+    const chunk = {
+      id: this.id,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: this.model,
+      choices: [
+        {
+          index: 0,
+          delta: { reasoning_content: reasoning },
+          finish_reason: null,
+        },
+      ],
+    };
+    this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+  }
+
+  feedText(text: string) {
+    if (this.inDSML) {
+      this.dsmlBuffer += text;
+      return;
+    }
+
+    const combined = this.carry + text;
+    const dsmlIdx = combined.indexOf("<｜DSML｜tool_calls>");
+
+    if (dsmlIdx !== -1) {
+      this.inDSML = true;
+      const pre = combined.slice(0, dsmlIdx);
+      if (pre.length > 0) {
+        this.emitContentDelta(pre);
+      }
+      this.dsmlBuffer = combined.slice(dsmlIdx);
+      this.carry = "";
+    } else {
+      const partialIdx = combined.lastIndexOf("<");
+      if (partialIdx !== -1 && combined.length - partialIdx < 20) {
+        const emitText = combined.slice(0, partialIdx);
+        this.carry = combined.slice(partialIdx);
+        if (emitText.length > 0) {
+          this.emitContentDelta(emitText);
+        }
+      } else {
+        this.emitContentDelta(combined);
+        this.carry = "";
+      }
+    }
+  }
+
+  private emitContentDelta(content: string) {
+    const chunk = {
+      id: this.id,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: this.model,
+      choices: [{ index: 0, delta: { content }, finish_reason: null }],
+    };
+    this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+  }
+
+  finish() {
+    if (this.carry.length > 0) {
+      if (this.inDSML) {
+        this.dsmlBuffer += this.carry;
+      } else {
+        this.emitContentDelta(this.carry);
+      }
+      this.carry = "";
+    }
+
+    if (this.inDSML || this.dsmlBuffer.includes("<｜DSML｜tool_calls>")) {
+      const match = /<｜DSML｜tool_calls>([\s\S]*?)(?:<\/｜DSML｜tool_calls>|$)/.exec(this.dsmlBuffer);
+      if (match) {
+        const dsmlContent = match[1];
+        const invokeRegex = /<｜DSML｜invoke\s+name="([^"]+)">([\s\S]*?)(?:<\/｜DSML｜invoke>|$)/g;
+        let invMatch;
+        const toolCalls: any[] = [];
+        let idx = 0;
+
+        while ((invMatch = invokeRegex.exec(dsmlContent)) !== null) {
+          const toolName = invMatch[1].trim();
+          const paramsContent = invMatch[2];
+          const paramRegex = /<｜DSML｜parameter\s+name="([^"]+)"(?:\s+string="true")?>([\s\S]*?)(?:<\/｜DSML｜parameter>|$)/g;
+          let pMatch;
+          const args: Record<string, any> = {};
+
+          while ((pMatch = paramRegex.exec(paramsContent)) !== null) {
+            const paramName = pMatch[1].trim();
+            const paramValue = pMatch[2].trim();
+            try {
+              if (
+                (paramValue.startsWith("{") && paramValue.endsWith("}")) ||
+                (paramValue.startsWith("[") && paramValue.endsWith("]"))
+              ) {
+                args[paramName] = JSON.parse(paramValue);
+              } else {
+                args[paramName] = paramValue;
+              }
+            } catch {
+              args[paramName] = paramValue;
+            }
+          }
+
+          toolCalls.push({
+            index: idx++,
+            id: "call_" + Math.random().toString(36).substring(2, 11),
+            type: "function",
+            function: {
+              name: toolName,
+              arguments: JSON.stringify(args),
+            },
+          });
+        }
+
+        if (toolCalls.length > 0) {
+          const chunk = {
+            id: this.id,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: this.model,
+            choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: "tool_calls" }],
+          };
+          this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          this.res.write("data: [DONE]\n\n");
+          return;
+        }
+      }
+    }
+
+    const endChunk = {
+      id: this.id,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: this.model,
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    };
+    this.res.write(`data: ${JSON.stringify(endChunk)}\n\n`);
+    this.res.write("data: [DONE]\n\n");
+  }
 }
 
 interface SessionCache {
@@ -382,9 +540,71 @@ export default async function (pi: ExtensionAPI) {
             throw new Error("No response from upstream Codebuff");
           }
 
-          // Forward status and headers
+          if (!isStream) {
+            const data = (await upstreamRes.json()) as any;
+            const choice = data.choices?.[0];
+            if (choice?.message?.content && choice.message.content.includes("<｜DSML｜tool_calls>")) {
+              const rawContent = choice.message.content;
+              const match = /<｜DSML｜tool_calls>([\s\S]*?)(?:<\/｜DSML｜tool_calls>|$)/.exec(rawContent);
+              if (match) {
+                const dsmlContent = match[1];
+                const preText = rawContent.slice(0, match.index).trim();
+                const invokeRegex = /<｜DSML｜invoke\s+name="([^"]+)">([\s\S]*?)(?:<\/｜DSML｜invoke>|$)/g;
+                let invMatch;
+                const toolCalls: any[] = [];
+                let idx = 0;
+
+                while ((invMatch = invokeRegex.exec(dsmlContent)) !== null) {
+                  const toolName = invMatch[1].trim();
+                  const paramsContent = invMatch[2];
+                  const paramRegex = /<｜DSML｜parameter\s+name="([^"]+)"(?:\s+string="true")?>([\s\S]*?)(?:<\/｜DSML｜parameter>|$)/g;
+                  let pMatch;
+                  const args: Record<string, any> = {};
+
+                  while ((pMatch = paramRegex.exec(paramsContent)) !== null) {
+                    const paramName = pMatch[1].trim();
+                    const paramValue = pMatch[2].trim();
+                    try {
+                      if (
+                        (paramValue.startsWith("{") && paramValue.endsWith("}")) ||
+                        (paramValue.startsWith("[") && paramValue.endsWith("]"))
+                      ) {
+                        args[paramName] = JSON.parse(paramValue);
+                      } else {
+                        args[paramName] = paramValue;
+                      }
+                    } catch {
+                      args[paramName] = paramValue;
+                    }
+                  }
+
+                  toolCalls.push({
+                    index: idx++,
+                    id: "call_" + Math.random().toString(36).substring(2, 11),
+                    type: "function",
+                    function: {
+                      name: toolName,
+                      arguments: JSON.stringify(args),
+                    },
+                  });
+                }
+
+                if (toolCalls.length > 0) {
+                  choice.message.content = preText || null;
+                  choice.message.tool_calls = toolCalls;
+                  choice.finish_reason = "tool_calls";
+                }
+              }
+            }
+            res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(data));
+            if (runId) await client.finishRun(runId);
+            return;
+          }
+
+          // Forward status and headers for streaming
           res.writeHead(upstreamRes.status, {
-            "Content-Type": upstreamRes.headers.get("Content-Type") || (isStream ? "text/event-stream" : "application/json"),
+            "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
             Connection: "keep-alive",
           });
@@ -394,7 +614,7 @@ export default async function (pi: ExtensionAPI) {
             return;
           }
 
-          // Stream upstream response back to pi
+          // Stream upstream response back to pi with DSML parsing
           const reader = upstreamRes.body.getReader();
           let finished = false;
 
@@ -415,14 +635,44 @@ export default async function (pi: ExtensionAPI) {
             if (!finished) cleanup();
           });
 
+          const transformer = new DSMLStreamTransformer(
+            res,
+            "chatcmpl-" + Math.random().toString(36).substring(2, 12),
+            requestedModel
+          );
+
+          const decoder = new TextDecoder();
+          let sseBuffer = "";
+
           const pump = async () => {
             try {
               while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
-                res.write(value);
+                sseBuffer += decoder.decode(value, { stream: true });
+                const lines = sseBuffer.split("\n");
+                sseBuffer = lines.pop() || "";
+
+                for (const line of lines) {
+                  const trimmed = line.trim();
+                  if (!trimmed.startsWith("data: ")) continue;
+                  const dataStr = trimmed.slice(6).trim();
+                  if (dataStr === "[DONE]") continue;
+
+                  try {
+                    const parsed = JSON.parse(dataStr);
+                    const delta = parsed.choices?.[0]?.delta;
+                    if (delta?.reasoning_content) {
+                      transformer.feedReasoning(delta.reasoning_content);
+                    }
+                    if (delta?.content) {
+                      transformer.feedText(delta.content);
+                    }
+                  } catch {}
+                }
               }
             } finally {
+              transformer.finish();
               res.end();
               await cleanup();
             }
