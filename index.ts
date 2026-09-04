@@ -161,6 +161,119 @@ To call any tool, use the standard DSML tool format:
 </｜｜DSML｜｜tool_calls>`;
 }
 
+function normalizeToolArguments(toolName: string, args: Record<string, any>): Record<string, any> {
+  if (!args || typeof args !== "object") return args;
+
+  // 1. Tool: ask_user_question
+  if (toolName === "ask_user_question") {
+    let questions = args.questions;
+    if (typeof questions === "string") {
+      try {
+        questions = JSON.parse(questions);
+      } catch {}
+    }
+    if (!Array.isArray(questions)) {
+      if (args.question) {
+        questions = [
+          {
+            question: String(args.question),
+            header: String(args.header || "Question").slice(0, 16),
+            options: Array.isArray(args.options)
+              ? args.options
+              : [
+                  { label: "Yes", description: "Confirm" },
+                  { label: "No", description: "Cancel" },
+                ],
+          },
+        ];
+      } else {
+        questions = [];
+      }
+    }
+
+    // Sanitize each question strictly for TypeBox & runtime validation
+    args.questions = questions.slice(0, 4).map((q: any, qIdx: number) => {
+      let header = String(q.header || `Question ${qIdx + 1}`)
+        .trim()
+        .slice(0, 16);
+      if (!header) header = `Question ${qIdx + 1}`;
+
+      let questionText = String(q.question || "").trim();
+      if (!questionText.endsWith("?")) questionText += "?";
+
+      let options = Array.isArray(q.options) ? q.options : [];
+      options = options.slice(0, 4).map((opt: any, oIdx: number) => {
+        let label = String(opt.label || `Option ${oIdx + 1}`)
+          .trim()
+          .slice(0, 60);
+        // Replace reserved labels that cause runtime validation rejections
+        if (/^(Other|Type something\.|Next)$/i.test(label)) {
+          label = `Choice ${oIdx + 1}`;
+        }
+        let description = String(opt.description || label).trim();
+        return {
+          label,
+          description,
+          ...(opt.preview ? { preview: String(opt.preview) } : {}),
+        };
+      });
+
+      if (options.length < 2) {
+        options.push({ label: "Confirm", description: "Proceed" });
+        options.push({ label: "Cancel", description: "Abort" });
+      }
+
+      return {
+        question: questionText,
+        header,
+        options,
+        multiSelect: Boolean(q.multiSelect && q.multiSelect !== "false"),
+      };
+    });
+  }
+
+  // 2. Tool: bash
+  if (toolName === "bash") {
+    args.command = String(
+      args.command || args.cmd || args.code || args.script || ""
+    ).trim();
+  }
+
+  // 3. Tool: read
+  if (toolName === "read") {
+    if (args.offset !== undefined) args.offset = parseInt(String(args.offset), 10) || 0;
+    if (args.limit !== undefined) args.limit = parseInt(String(args.limit), 10) || 0;
+  }
+
+  // 4. Tool: write
+  if (toolName === "write") {
+    args.content =
+      args.content !== undefined
+        ? String(args.content)
+        : args.code !== undefined
+        ? String(args.code)
+        : "";
+  }
+
+  // 5. Tool: todo
+  if (toolName === "todo") {
+    if (args.id !== undefined) args.id = parseInt(String(args.id), 10) || 0;
+  }
+
+  // General numeric type coercion for tools expecting numbers
+  for (const [k, v] of Object.entries(args)) {
+    if (
+      typeof v === "string" &&
+      /^-?\d+$/.test(v.trim()) &&
+      !["path", "command", "content", "query", "header", "label"].includes(k)
+    ) {
+      args[k] = parseInt(v.trim(), 10);
+    }
+  }
+
+  return args;
+}
+
 function extractToolCallsFromText(rawText: string): {
   cleanText: string;
   toolCalls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }>;
@@ -184,7 +297,23 @@ function extractToolCallsFromText(rawText: string): {
 
     while ((invMatch = invokeRegex.exec(inner)) !== null) {
       foundInvoke = true;
-      const toolName = invMatch[1].trim();
+      let rawToolName = invMatch[1].trim();
+      // Normalize common lowercase tool names
+      const knownTools = [
+        "bash",
+        "read",
+        "write",
+        "edit",
+        "ask_user_question",
+        "todo",
+        "web_search",
+        "fetch_content",
+        "smart_recall",
+      ];
+      const toolName = knownTools.includes(rawToolName.toLowerCase())
+        ? rawToolName.toLowerCase()
+        : rawToolName;
+
       const body = invMatch[2];
       const args: Record<string, any> = {};
 
@@ -216,39 +345,60 @@ function extractToolCallsFromText(rawText: string): {
         }
       }
 
+      const normalizedArgs = normalizeToolArguments(toolName, args);
+
       toolCalls.push({
         id: "call_" + Math.random().toString(36).substring(2, 11),
         type: "function",
         function: {
           name: toolName,
-          arguments: JSON.stringify(args),
+          arguments: JSON.stringify(normalizedArgs),
         },
       });
     }
 
-    // 2. If no invoke tag was found, check direct parameter tags (like <command>...</command> -> bash)
+    // 2. If no invoke tag was found, check direct parameter tags
     if (!foundInvoke) {
       const cmdMatch = /<command>([\s\S]*?)<\/command>/i.exec(inner);
       if (cmdMatch) {
+        const args = normalizeToolArguments("bash", { command: cmdMatch[1].trim() });
         toolCalls.push({
           id: "call_" + Math.random().toString(36).substring(2, 11),
           type: "function",
           function: {
             name: "bash",
-            arguments: JSON.stringify({ command: cmdMatch[1].trim() }),
+            arguments: JSON.stringify(args),
           },
         });
       } else {
-        const pathMatch = /<path>([\s\S]*?)<\/path>/i.exec(inner);
-        if (pathMatch) {
+        const qMatch = /<questions>([\s\S]*?)<\/questions>/i.exec(inner);
+        if (qMatch) {
+          let qVal: any = qMatch[1].trim();
+          try {
+            qVal = JSON.parse(qVal);
+          } catch {}
+          const args = normalizeToolArguments("ask_user_question", { questions: qVal });
           toolCalls.push({
             id: "call_" + Math.random().toString(36).substring(2, 11),
             type: "function",
             function: {
-              name: "read",
-              arguments: JSON.stringify({ path: pathMatch[1].trim() }),
+              name: "ask_user_question",
+              arguments: JSON.stringify(args),
             },
           });
+        } else {
+          const pathMatch = /<path>([\s\S]*?)<\/path>/i.exec(inner);
+          if (pathMatch) {
+            const args = normalizeToolArguments("read", { path: pathMatch[1].trim() });
+            toolCalls.push({
+              id: "call_" + Math.random().toString(36).substring(2, 11),
+              type: "function",
+              function: {
+                name: "read",
+                arguments: JSON.stringify(args),
+              },
+            });
+          }
         }
       }
     }
