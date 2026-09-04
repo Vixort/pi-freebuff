@@ -858,7 +858,7 @@ export default async function (pi: ExtensionAPI) {
               errMsg = errObj.message || errObj.error || errText;
               if (errObj.status === "banned") {
                 errMsg =
-                  "This Freebuff account has been suspended. Please run `/freebuff` or `./update.sh add <TOKEN>` to add a new token.";
+                  "This Freebuff account has been suspended. Please run `/freebuff` or `./managerversion.sh add <TOKEN>` to add a new token.";
               } else if (errObj.status === "rate_limited") {
                 errMsg =
                   "Daily quota reached for this account. Run `/freebuff` to add another account to the pool.";

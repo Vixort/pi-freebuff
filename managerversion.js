@@ -177,6 +177,127 @@ async function actionFullAutoUpdate() {
   console.log(`\n${c.green}>> Auto-update completed! Tip: Type /reload inside pi CLI.${c.reset}`);
 }
 
+async function actionClearStaleSessions() {
+  console.log(`${c.yellow}${c.bold}>> Clearing / Resetting Stale Cloud Sessions...${c.reset}`);
+  const tokens = getTokens();
+  if (tokens.length === 0) {
+    console.log(`   ${c.yellow}(No tokens found to clear)${c.reset}`);
+    return;
+  }
+
+  for (const item of tokens) {
+    try {
+      const res = await fetch("https://www.codebuff.com/api/v1/freebuff/session", {
+        method: "DELETE",
+        headers: {
+          Authorization: `Bearer ${item.token}`,
+          "User-Agent": "ai-sdk/openai-compatible/1.0.25/codebuff",
+        },
+        signal: AbortSignal.timeout(4000),
+      });
+      console.log(
+        `   [${item.key}] Reset status: ${res.status} (${
+          res.status === 200 ? "Cleaned" : "No active session"
+        })`
+      );
+    } catch (err) {
+      console.log(`   [${item.key}] Error: ${err.message}`);
+    }
+  }
+  console.log(`${c.green}>> Done clearing stale sessions!${c.reset}`);
+}
+
+async function actionHelpTroubleshooting() {
+  console.log(`${c.cyan}${c.bold}══════════════════════════════════════════════════════════════${c.reset}`);
+  console.log(`${c.cyan}${c.bold}            Freebuff Help & Troubleshooting Guide             ${c.reset}`);
+  console.log(`${c.cyan}${c.bold}══════════════════════════════════════════════════════════════${c.reset}\n`);
+
+  console.log(`${c.bold}1. วิธีรับ Auth Token ใหม่:${c.reset}`);
+  console.log(`   - ไปที่เว็บ: ${c.cyan}https://freebuff.llm.pm${c.reset}`);
+  console.log(`   - ล็อกอินด้วยบัญชี Freebuff / Google / GitHub แล้วคัดลอก Token`);
+  console.log(`   - นำมาใส่ผ่านเมนูข้อ [4] "Add New Token" หรือรัน: ./managerversion.sh add <TOKEN>\n`);
+
+  console.log(`${c.bold}2. การแก้ปัญหา Error ทั่วไป:${c.reset}`);
+  console.log(`   ${c.yellow}• Error 403 (banned / account unavailable):${c.reset}`);
+  console.log(`     - เกิดจากเซิร์ฟเวอร์ตรวจจับการยิง request ผิดปกติในบัญชีเดิม`);
+  console.log(`     - แก้โดย: ใช้บัญชีสำรองใหม่จาก freebuff.llm.pm แล้วเพิ่มเข้า Pool`);
+  console.log(`   ${c.yellow}• Error 429 (rate_limited):${c.reset}`);
+  console.log(`     - โควต้าฟรีประจำวันเต็ม (รีเซ็ตทุก 14:00 น. เวลาไทย / เที่ยงคืนเวลาแปซิฟิก)`);
+  console.log(`     - แก้โดย: เพิ่มบัญชีสำรองอีก 1-2 บัญชีเข้า Pool ระบบจะสลับบัญชีให้อัตโนมัติ`);
+  console.log(`   ${c.yellow}• Error 409 (session_superseded / model_locked):${c.reset}`);
+  console.log(`     - เซิร์ฟเวอร์ยังมี Session เก่าค้างอยู่`);
+  console.log(`     - แก้โดย: เลือกเมนูข้อ [7] "Clear / Reset Stale Cloud Sessions"\n`);
+
+  console.log(`${c.bold}3. การใช้งานใน pi CLI:${c.reset}`);
+  console.log(`   - เปิดเมนูใน pi:   พิมพ์ ${c.cyan}/freebuff${c.reset}`);
+  console.log(`   - สลับโมเดล:       พิมพ์ ${c.cyan}/model${c.reset} แล้วเลือกใต้กลุ่ม Freebuff (Native)`);
+  console.log(`   - สลับบัญชีทันที:  พิมพ์ ${c.cyan}/freebuff rotate${c.reset}`);
+  console.log(`   - เพิ่ม Token ใน pi: พิมพ์ ${c.cyan}/freebuff add <TOKEN>${c.reset}\n`);
+
+  process.stdout.write(`Checking connection to Codebuff servers... `);
+  try {
+    const start = Date.now();
+    const res = await fetch("https://www.codebuff.com/healthz", {
+      signal: AbortSignal.timeout(3000),
+    });
+    const ms = Date.now() - start;
+    console.log(`${c.green}Online (${ms}ms, HTTP ${res.status})${c.reset}`);
+  } catch (e) {
+    console.log(`${c.red}Unreachable (${e.message})${c.reset}`);
+  }
+}
+
+async function actionUninstallPi() {
+  console.log(`${c.red}${c.bold}>> Uninstall / Remove pi-freebuff from pi CLI${c.reset}`);
+  const confirm = await promptText(
+    `Are you sure you want to remove pi-freebuff from pi CLI? (y/N): `
+  );
+  if (confirm.toLowerCase() !== "y") {
+    console.log(`${c.dim}Cancelled.${c.reset}`);
+    return;
+  }
+
+  // 1. Remove from pi settings.json
+  const settingsPath = path.join(os.homedir(), ".pi", "agent", "settings.json");
+  if (fs.existsSync(settingsPath)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+      if (Array.isArray(data.packages)) {
+        const initialCount = data.packages.length;
+        data.packages = data.packages.filter(
+          (p) => !p.includes("freebufftopi") && !p.includes("pi-freebuff")
+        );
+        if (data.packages.length < initialCount) {
+          fs.writeFileSync(settingsPath, JSON.stringify(data, null, 2));
+          console.log(`${c.green}>> Removed pi-freebuff from ~/.pi/agent/settings.json${c.reset}`);
+        }
+      }
+    } catch (err) {
+      console.log(`${c.yellow}>> Could not update settings.json: ${err.message}${c.reset}`);
+    }
+  }
+
+  try {
+    execSync(`pi remove "${DIR}"`, { stdio: "ignore" });
+  } catch {}
+
+  // 2. Optional: remove credentials
+  const delCreds = await promptText(
+    `Also delete stored credentials file (${CREDS_FILE})? (y/N): `
+  );
+  if (delCreds.toLowerCase() === "y" && fs.existsSync(CREDS_FILE)) {
+    try {
+      fs.unlinkSync(CREDS_FILE);
+      console.log(`${c.green}>> Deleted ${CREDS_FILE}${c.reset}`);
+    } catch (err) {
+      console.log(`${c.yellow}>> Could not delete credentials file: ${err.message}${c.reset}`);
+    }
+  }
+
+  console.log(`${c.green}>> Successfully uninstalled pi-freebuff from pi CLI.${c.reset}`);
+  console.log(`${c.dim}Tip: Type /reload inside pi CLI if it is running.${c.reset}`);
+}
+
 // -------------------------------------------------------------
 // Interactive TUI
 // -------------------------------------------------------------
@@ -188,6 +309,18 @@ const MENU_ITEMS = [
   { label: "Add New Token to Pool", action: actionAddToken },
   { label: "Set / Replace Primary Token", action: actionSetPrimaryToken },
   { label: "Verify & List Models in pi CLI", action: actionVerifyPi },
+  {
+    label: "Clear / Reset Stale Cloud Sessions (แก้ปัญหา Session ค้าง)",
+    action: actionClearStaleSessions,
+  },
+  {
+    label: "Help & Troubleshooting (คู่มือช่วยเหลือ & แก้ปัญหา)",
+    action: actionHelpTroubleshooting,
+  },
+  {
+    label: "Uninstall / Remove pi-freebuff from pi CLI",
+    action: actionUninstallPi,
+  },
   { label: "Exit", action: null },
 ];
 
@@ -322,6 +455,24 @@ async function main() {
   if (cmd === "verify" || cmd === "check") {
     printBanner();
     actionVerifyPi();
+    return;
+  }
+
+  if (cmd === "uninstall" || cmd === "remove") {
+    printBanner();
+    await actionUninstallPi();
+    return;
+  }
+
+  if (cmd === "help") {
+    printBanner();
+    await actionHelpTroubleshooting();
+    return;
+  }
+
+  if (cmd === "reset" || cmd === "clear-session") {
+    printBanner();
+    await actionClearStaleSessions();
     return;
   }
 
