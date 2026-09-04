@@ -11,7 +11,21 @@ Extension สำหรับเชื่อมต่อ **Freebuff (Codebuff)** 
 - **Auto Model Discovery:** ดึงรายชื่อโมเดลฟรีที่โควต้าของคุณใช้งานได้แบบสดๆ เช่น `deepseek/deepseek-v4-flash`, `mimo/mimo-v2.5`, `upstage/solar-pro4`, `minimax/minimax-m3`
 - **Sticky Token Pool & Auto-Rotation:** รองรับการใส่หลายบัญชีพร้อมกัน โดยระบบจะใช้บัญชีเดิมแบบ **Sticky** (ใช้ต่อเนื่อง 25 ครั้ง หรือ 1 ชั่วโมง) เพื่อจำลองพฤติกรรมคนใช้งานจริง ไม่สลับไปมาถี่ๆ จนผิดธรรมชาติ และสลับไปบัญชีสำรองทันทีหากบัญชีหลักติด Rate Limit หรือโควต้าหมด
 - **Dynamic Session & Model Switching:** จัดการคิว Waiting Room และสลับโมเดลให้อัตโนมัติเบื้องหลัง
-- **คำสั่ง `/freebuff` ใน TUI:** เรียกดูสถานะ, เช็คโควต้าประจำวัน (Quota used/limit), และดูรายการโมเดลได้ตลอดเวลา
+- **คำสั่ง `/freebuff` ใน TUI:** 
+  - เพิ่มหรือสลับ Token ได้ใน TUI ทันที
+  - เรียกดูสถานะ Token Pool, เช็คโควต้าประจำวัน (Quota used/limit), และดูรายการโมเดลได้ตลอดเวลา
+
+---
+
+## คำสั่งใน pi CLI (`/freebuff`)
+
+คุณสามารถจัดการบัญชี Freebuff ได้โดยตรงจากหน้าต่าง pi CLI:
+
+- `/freebuff` : เปิดเมนูควบคุม (มีปุ่มกดเพิ่ม Token, สลับบัญชี, ดูโควต้า และเลือกโมเดล)
+- `/freebuff login` : แสดงลิงก์ล็อกอิน [freebuff.llm.pm](https://freebuff.llm.pm) และเปิดกล่องข้อความให้วาง Token ทันที
+- `/freebuff add <TOKEN>` : เพิ่ม Token ใหม่เข้า Token Pool ทันที
+- `/freebuff rotate` : บังคับสลับไปใช้บัญชีถัดไปใน Pool ทันที
+- `/model` : สลับโมเดลที่ต้องการใช้งาน (เช่น DeepSeek V4 Flash 07/31, MiMo 2.5, Solar Pro 4)
 
 ---
 
