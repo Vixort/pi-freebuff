@@ -45,20 +45,35 @@ Extension สำหรับเชื่อมต่อ **Freebuff (Codebuff)** 
 
 ---
 
-ในโปรเจกต์นี้มีสคริปต์ `update.sh` สำหรับจัดการบัญชีและอัปเดต:
+## การจัดการ Token และอัปเดต (Cross-Platform TUI Updater)
 
+โปรเจกต์นี้มีระบบจัดการและอัปเดตแบบ **Interactive TUI** ที่รองรับทั้ง **Windows, Linux และ macOS**:
+
+### วิธีเปิดหน้าต่างเมนู TUI:
+- **Linux / macOS:** `./update.sh`
+- **Windows (Command Prompt):** `update.cmd`
+- **Windows (PowerShell):** `.\update.ps1`
+- **หรือใช้ npm:** `npm run update`
+
+เมื่อเปิดขึ้นมาจะมีเมนู TUI ให้เลือกด้วยปุ่มลูกศร ↑ / ↓ หรือกดตัวเลข:
+1. `Full Auto Update (Git Pull + Verify with pi)` — ดึงโค้ดล่าสุดและตรวจสอบกับ pi อัตโนมัติ
+2. `Pull Latest Code (git pull)` — ดึงโค้ดล่าสุดจาก Git เท่านั้น
+3. `View Token Pool Status` — ตรวจสอบบัญชีทั้งหมดใน Pool
+4. `Add New Token to Pool` — เพิ่ม Token บัญชีสำรอง
+5. `Set / Replace Primary Token` — ตั้งค่าหรือเปลี่ยน Token หลัก
+6. `Verify & List Models in pi CLI` — ตรวจสอบการลงทะเบียนโมเดลใน pi
+7. `Exit` — ออกจากเมนู
+
+### หรือใช้งานผ่านคำสั่งด่วน (Command Line):
 ```bash
-# 1. ดูรายการ Token ทั้งหมดที่มีในระบบ
+# ดูรายการ Token ทั้งหมดที่มีในระบบ
 ./update.sh list
 
-# 2. ตั้งค่า Token หลัก (Account 1)
+# ตั้งค่า Token หลัก
 ./update.sh <TOKEN_หลัก>
 
-# 3. เพิ่ม Token สำรองเข้า Pool สำหรับสลับใช้งาน (Account 2, 3...)
+# เพิ่ม Token สำรองเข้า Pool
 ./update.sh add <TOKEN_สำรอง>
-
-# 4. ดึงอัปเดตโค้ดล่าสุดจาก Git
-./update.sh
 ```
 
 ---

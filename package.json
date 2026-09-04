@@ -6,7 +6,7 @@
   "keywords": ["pi-package"],
   "license": "MIT",
   "scripts": {
-    "update": "./update.sh"
+    "update": "node update.js"
   },
   "pi": {
     "extensions": ["./index.ts"]
