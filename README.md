@@ -1,69 +1,82 @@
 # pi-freebuff
 
-Extension สำหรับเชื่อมต่อ [Freebuff2API](https://github.com/Quorinex/Freebuff2API) เข้ากับ **pi CLI** พร้อมระบบ Auto-Discovery ดึงรายชื่อโมเดลที่ใช้งานได้อัตโนมัติ
+Extension สำหรับเชื่อมต่อ **Freebuff (Codebuff)** เข้ากับ **pi CLI** แบบ **Embedded Native (All-in-One)** โดย **ไม่ต้องใช้ Docker, ไม่ต้องลง Go และไม่มี Background Service ภายนอก**
 
-## คุณสมบัติ (Features)
+---
 
-- **Dynamic Model Discovery:** ดึงรายชื่อโมเดลทั้งหมดที่ Freebuff ให้บริการจาก `/v1/models` มาลงทะเบียนใน pi CLI โดยอัตโนมัติเมื่อเริ่มโปรแกรม
-- **Fallback Safe:** หาก Freebuff2API ยังไม่ได้เปิด จะใช้โมเดลมาตรฐานเริ่มต้นทันทีโดยไม่ค้างหรือไม่ทำให้ pi แฮงก์
-- **`/freebuff` Command:** พิมพ์คำสั่ง `/freebuff` ใน pi เพื่อเช็คสถานะการเชื่อมต่อ และเปิดดูรายชื่อโมเดลสดๆ ที่กำลังออนไลน์ได้ตลอดเวลา
-- **Ready to Share:** โครงสร้างเป็น pi-package มาตรฐาน สามารถติดตั้งผ่าน Git, npm หรือ local path ได้ทันที
+## จุดเด่น (Highlights)
+
+- **Zero-Docker / Zero-Daemon:** ทำงานเป็น in-process adapter ขนาดเบาภายใน pi CLI เปิดและปิดตามรอบการใช้งานของ pi ทันที
+- **Auto Auth Token:** ตรวจพบและโหลด `authToken` จาก `~/.config/manicode/credentials.json` ให้อัตโนมัติ (หากเคยล็อกอินผ่าน `freebuff` CLI ไว้แล้ว ไม่ต้องตั้งค่าอะไรเลย)
+- **Auto Model Discovery:** ดึงรายชื่อโมเดลฟรีที่โควต้าของคุณใช้งานได้แบบสดๆ เช่น `deepseek/deepseek-v4-flash`, `mimo/mimo-v2.5`, `upstage/solar-pro4`, `minimax/minimax-m3`
+- **Dynamic Session & Model Switching:** จัดการคิว Waiting Room และสลับโมเดลให้อัตโนมัติเบื้องหลัง
+- **คำสั่ง `/freebuff` ใน TUI:** เรียกดูสถานะ, เช็คโควต้าประจำวัน (Quota used/limit), และดูรายการโมเดลได้ตลอดเวลา
 
 ---
 
 ## วิธีติดตั้งและใช้งาน
 
-### 1. ติดตั้ง Extension นี้ใน pi
+### 1. ติดตั้ง Extension เข้า pi CLI
 
 เลือกวิธีใดวิธีหนึ่ง:
 
-**ติดตั้งจาก Local Path (เครื่องตัวเอง):**
+**ติดตั้งจากโฟลเดอร์นี้ในเครื่อง:**
 ```bash
-pi install /path/to/freebufftopi
+pi install /home/null/Projects/freebufftopi
 ```
 
-**หรือติดตั้งผ่าน Git (เมื่อนำขึ้น GitHub):**
+**หรือติดตั้งผ่าน Git (สำหรับแชร์ให้ผู้อื่น):**
 ```bash
 pi install git:github.com/<username>/pi-freebuff
 ```
 
-**หรือทดลองรันแบบชั่วคราว:**
+**หรือทดลองรันชั่วคราว:**
 ```bash
 pi -e ./index.ts
 ```
 
 ---
 
-### 2. รัน Freebuff2API Server
+### 2. เตรียม Auth Token (ทำเพียงครั้งแรก)
 
-1. รับ Token จากเว็บ [freebuff.llm.pm](https://freebuff.llm.pm) หรือล็อกอินผ่าน `npm i -g freebuff && freebuff` (Token จะอยู่ใน `~/.config/manicode/credentials.json`)
-2. รัน proxy server ด้วย Docker:
-   ```bash
-   docker run -d --name freebuff2api \
-     -p 8080:8080 \
-     -e AUTH_TOKENS="<AUTH_TOKEN_ของคุณ>" \
-     --restart unless-stopped \
-     ghcr.io/quorinex/freebuff2api:latest
-   ```
+หากคุณเคยติดตั้งและล็อกอิน `freebuff` CLI ไว้แล้ว ตัว extension จะดึง token มาใช้ให้อัตโนมัติโดยที่คุณไม่ต้องทำอะไรเลย
+
+หากยังไม่เคยมี token ให้เลือกทำวิธีใดวิธีหนึ่ง:
+- **วิธีที่ 1 (ผ่าน CLI):**
+  ```bash
+  npm i -g freebuff
+  freebuff # ล็อกอินครั้งแรก token จะถูกบันทึกลง ~/.config/manicode/credentials.json
+  ```
+- **วิธีที่ 2 (ผ่าน Environment Variable):**
+  รับ token จาก [freebuff.llm.pm](https://freebuff.llm.pm) แล้วตั้งค่า:
+  ```bash
+  export FREEBUFF_AUTH_TOKEN="<token_ของคุณ>"
+  ```
 
 ---
 
 ### 3. เรียกใช้งานใน pi CLI
 
-- ดูโมเดลทั้งหมดที่ดึงมาจาก Freebuff:
+- **ดูรายการโมเดลที่ใช้งานได้:**
   ```bash
   pi --list-models | grep freebuff
   ```
-- ใช้งานโมเดลโดยตรง:
+
+- **เริ่มสนทนาผ่านโมเดลของ Freebuff:**
   ```bash
-  pi --model freebuff/google/gemini-2.5-flash-lite
+  pi --model freebuff/deepseek/deepseek-v4-flash
   ```
-- ใน TUI พิมพ์ `/model` เพื่อเลือกโมเดล หรือพิมพ์ `/freebuff` เพื่อตรวจสอบการเชื่อมต่อและดูรายชื่อโมเดลสดๆ
+  หรือ:
+  ```bash
+  pi --model freebuff/mimo/mimo-v2.5
+  ```
+
+- **ในหน้าต่าง Interactive TUI:**
+  - พิมพ์ `/model` เพื่อเลือกโมเดลใต้กลุ่ม **Freebuff (Native)**
+  - พิมพ์ `/freebuff` เพื่อดูสถานะเซิร์ฟเวอร์, ดูโควต้าการใช้งาน และคำแนะนำการสลับโมเดล
 
 ---
 
-## Configuration (ตัวเลือกเสริม)
+## License
 
-สามารถกำหนด Environment Variables ได้:
-- `FREEBUFF_BASE_URL`: URL ของ Freebuff2API (ค่าเริ่มต้น `http://localhost:8080/v1`)
-- `FREEBUFF_API_KEY`: API Key กรณีเปิดใช้งาน `API_KEYS` ใน Freebuff2API (ค่าเริ่มต้น `freebuff`)
+MIT
