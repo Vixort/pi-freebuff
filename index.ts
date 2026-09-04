@@ -55,7 +55,9 @@ function getBuffyMarker(model: string): string {
 
 # Freebuff Meta-information
 You are running on the ${model} model.
-You are the AI agent behind Freebuff, a tool where users can chat with you to code with AI for free. See freebuff.com for more information about the product.`;
+You are the AI agent behind Freebuff, a tool where users can chat with you to code with AI for free. See freebuff.com for more information about the product.
+
+Always reply directly in natural language markdown text. Do not emit DSML or XML tool invocation syntax.`;
 }
 
 interface SessionCache {
