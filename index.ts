@@ -154,11 +154,11 @@ You are running on the ${model} model.
 You are the AI agent behind Freebuff, a tool where users can chat with you to code with AI for free. See freebuff.com for more information about the product.
 
 To call any tool, use the standard DSML tool format:
-<｜DSML｜tool_calls>
-<｜DSML｜invoke name="tool_name">
-<｜DSML｜parameter name="param_name" string="true">value</｜DSML｜parameter>
-</｜DSML｜invoke>
-</｜DSML｜tool_calls>`;
+<｜｜DSML｜｜tool_calls>
+<｜｜DSML｜｜invoke name="tool_name">
+<｜｜DSML｜｜parameter name="param_name" string="true">value</｜｜DSML｜｜parameter>
+</｜｜DSML｜｜invoke>
+</｜｜DSML｜｜tool_calls>`;
 }
 
 class DSMLStreamTransformer {
@@ -197,19 +197,19 @@ class DSMLStreamTransformer {
     }
 
     const combined = this.carry + text;
-    const dsmlIdx = combined.indexOf("<｜DSML｜tool_calls>");
+    const dsmlMatch = /<[|｜]+DSML[|｜]+tool_calls>/i.exec(combined);
 
-    if (dsmlIdx !== -1) {
+    if (dsmlMatch) {
       this.inDSML = true;
-      const pre = combined.slice(0, dsmlIdx);
+      const pre = combined.slice(0, dsmlMatch.index);
       if (pre.length > 0) {
         this.emitContentDelta(pre);
       }
-      this.dsmlBuffer = combined.slice(dsmlIdx);
+      this.dsmlBuffer = combined.slice(dsmlMatch.index);
       this.carry = "";
     } else {
       const partialIdx = combined.lastIndexOf("<");
-      if (partialIdx !== -1 && combined.length - partialIdx < 20) {
+      if (partialIdx !== -1 && combined.length - partialIdx < 25) {
         const emitText = combined.slice(0, partialIdx);
         this.carry = combined.slice(partialIdx);
         if (emitText.length > 0) {
@@ -243,11 +243,11 @@ class DSMLStreamTransformer {
       this.carry = "";
     }
 
-    if (this.inDSML || this.dsmlBuffer.includes("<｜DSML｜tool_calls>")) {
-      const match = /<｜DSML｜tool_calls>([\s\S]*?)(?:<\/｜DSML｜tool_calls>|$)/.exec(this.dsmlBuffer);
+    if (this.inDSML || /<[|｜]+DSML[|｜]+tool_calls>/i.test(this.dsmlBuffer)) {
+      const match = /<[|｜]+DSML[|｜]+tool_calls>([\s\S]*?)(?:<\/[|｜]+DSML[|｜]+tool_calls>|$)/i.exec(this.dsmlBuffer);
       if (match) {
         const dsmlContent = match[1];
-        const invokeRegex = /<｜DSML｜invoke\s+name="([^"]+)">([\s\S]*?)(?:<\/｜DSML｜invoke>|$)/g;
+        const invokeRegex = /<[|｜]+DSML[|｜]+invoke\s+name="([^"]+)">([\s\S]*?)(?:<\/[|｜]+DSML[|｜]+invoke>|$)/gi;
         let invMatch;
         const toolCalls: any[] = [];
         let idx = 0;
@@ -255,7 +255,7 @@ class DSMLStreamTransformer {
         while ((invMatch = invokeRegex.exec(dsmlContent)) !== null) {
           const toolName = invMatch[1].trim();
           const paramsContent = invMatch[2];
-          const paramRegex = /<｜DSML｜parameter\s+name="([^"]+)"(?:\s+string="true")?>([\s\S]*?)(?:<\/｜DSML｜parameter>|$)/g;
+          const paramRegex = /<[|｜]+DSML[|｜]+parameter\s+name="([^"]+)"(?:\s+[^>]*)?>([\s\S]*?)(?:<\/[|｜]+DSML[|｜]+parameter>|$)/gi;
           let pMatch;
           const args: Record<string, any> = {};
 
@@ -910,13 +910,13 @@ export default async function (pi: ExtensionAPI) {
           if (!isStream) {
             const data = (await upstreamRes.json()) as any;
             const choice = data.choices?.[0];
-            if (choice?.message?.content && choice.message.content.includes("<｜DSML｜tool_calls>")) {
+            if (choice?.message?.content && /<[|｜]+DSML[|｜]+tool_calls>/i.test(choice.message.content)) {
               const rawContent = choice.message.content;
-              const match = /<｜DSML｜tool_calls>([\s\S]*?)(?:<\/｜DSML｜tool_calls>|$)/.exec(rawContent);
+              const match = /<[|｜]+DSML[|｜]+tool_calls>([\s\S]*?)(?:<\/[|｜]+DSML[|｜]+tool_calls>|$)/i.exec(rawContent);
               if (match) {
                 const dsmlContent = match[1];
                 const preText = rawContent.slice(0, match.index).trim();
-                const invokeRegex = /<｜DSML｜invoke\s+name="([^"]+)">([\s\S]*?)(?:<\/｜DSML｜invoke>|$)/g;
+                const invokeRegex = /<[|｜]+DSML[|｜]+invoke\s+name="([^"]+)">([\s\S]*?)(?:<\/[|｜]+DSML[|｜]+invoke>|$)/gi;
                 let invMatch;
                 const toolCalls: any[] = [];
                 let idx = 0;
@@ -924,7 +924,7 @@ export default async function (pi: ExtensionAPI) {
                 while ((invMatch = invokeRegex.exec(dsmlContent)) !== null) {
                   const toolName = invMatch[1].trim();
                   const paramsContent = invMatch[2];
-                  const paramRegex = /<｜DSML｜parameter\s+name="([^"]+)"(?:\s+string="true")?>([\s\S]*?)(?:<\/｜DSML｜parameter>|$)/g;
+                  const paramRegex = /<[|｜]+DSML[|｜]+parameter\s+name="([^"]+)"(?:\s+[^>]*)?>([\s\S]*?)(?:<\/[|｜]+DSML[|｜]+parameter>|$)/gi;
                   let pMatch;
                   const args: Record<string, any> = {};
 
