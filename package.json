@@ -5,6 +5,9 @@
   "main": "index.ts",
   "keywords": ["pi-package"],
   "license": "MIT",
+  "scripts": {
+    "update": "./update.sh"
+  },
   "pi": {
     "extensions": ["./index.ts"]
   }
