@@ -39,6 +39,41 @@ const MODEL_DISPLAY_NAMES: Record<string, string> = {
   "z-ai/glm-5.3-flash": "GLM 5.3 Flash",
 };
 
+function saveAuthToken(newToken: string, accountKey?: string): string {
+  const credPath = path.join(os.homedir(), ".config", "manicode", "credentials.json");
+  fs.mkdirSync(path.dirname(credPath), { recursive: true });
+  let data: Record<string, any> = {};
+  if (fs.existsSync(credPath)) {
+    try {
+      data = JSON.parse(fs.readFileSync(credPath, "utf8"));
+    } catch {}
+  }
+
+  let key = accountKey;
+  if (!key) {
+    if (!data.default || !data.default.authToken) {
+      key = "default";
+    } else if (data.default.authToken === newToken.trim()) {
+      key = "default";
+    } else {
+      let count = 2;
+      while (data[`account_${count}`]) {
+        if (data[`account_${count}`].authToken === newToken.trim()) {
+          key = `account_${count}`;
+          break;
+        }
+        count++;
+      }
+      if (!key) key = `account_${count}`;
+    }
+  }
+
+  if (!data[key]) data[key] = {};
+  data[key].authToken = newToken.trim();
+  fs.writeFileSync(credPath, JSON.stringify(data, null, 2), { mode: 0o600 });
+  return key;
+}
+
 function getAuthTokens(): string[] {
   const tokens: string[] = [];
   if (process.env.FREEBUFF_AUTH_TOKENS) {
@@ -406,6 +441,28 @@ class TokenPool {
     return this.pool.length;
   }
 
+  addToken(token: string, name?: string): TokenState {
+    const clean = token.trim();
+    const existing = this.pool.find((p) => p.token === clean);
+    if (existing) {
+      existing.isBanned = false;
+      existing.cooldownUntil = 0;
+      return existing;
+    }
+    const idx = this.pool.length + 1;
+    const entry: TokenState = {
+      token: clean,
+      name: name || `Account ${idx} (${clean.slice(0, 6)}...)`,
+      client: new CodebuffClient(clean),
+      requestCount: 0,
+      lastUsed: 0,
+      cooldownUntil: 0,
+      isBanned: false,
+    };
+    this.pool.push(entry);
+    return entry;
+  }
+
   getActive(): { state: TokenState; client: CodebuffClient } | null {
     if (this.pool.length === 0) return null;
     const now = Date.now();
@@ -522,11 +579,10 @@ export default async function (pi: ExtensionAPI) {
   if (authTokens.length === 0) {
     pi.on("session_start", (_event, ctx) => {
       ctx.ui.notify(
-        "Freebuff: No auth token found! Run `./update.sh <TOKEN>` or set FREEBUFF_AUTH_TOKEN.",
+        "Freebuff: No auth token loaded. Type /freebuff to add a token or get login link.",
         "warning"
       );
     });
-    return;
   }
 
   const pool = new TokenPool(authTokens);
@@ -897,8 +953,80 @@ export default async function (pi: ExtensionAPI) {
 
   // Register /freebuff command for UI
   pi.registerCommand("freebuff", {
-    description: "View Freebuff status, accounts pool, and models",
-    handler: async (_args, ctx) => {
+    description: "Manage Freebuff tokens, rotation, models, and status",
+    handler: async (args, ctx) => {
+      const rawArgs = (args || "").trim();
+      const parts = rawArgs.split(/\s+/).filter(Boolean);
+      const sub = parts[0]?.toLowerCase();
+
+      // 1. Subcommand: /freebuff add <token>
+      if (sub === "add") {
+        let tokenToAdd = parts.slice(1).join(" ").trim();
+        if (!tokenToAdd && ctx.hasUI) {
+          tokenToAdd = (
+            await ctx.ui.input(
+              "Enter Freebuff Auth Token (from https://freebuff.llm.pm):",
+              "Paste token here"
+            )
+          )?.trim();
+        }
+        if (!tokenToAdd) {
+          ctx.ui.notify("No token entered.", "warning");
+          return;
+        }
+        const savedKey = saveAuthToken(tokenToAdd);
+        const added = pool.addToken(tokenToAdd);
+        ctx.ui.notify(
+          `Token saved as [${savedKey}] and added to pool (${pool.size} account(s) ready).`,
+          "info"
+        );
+        return;
+      }
+
+      // 2. Subcommand: /freebuff login
+      if (sub === "login") {
+        if (ctx.hasUI) {
+          ctx.ui.notify(
+            "1. Open https://freebuff.llm.pm in browser\n2. Log in and copy your Auth Token\n3. Paste it in the prompt below.",
+            "info"
+          );
+          const inputToken = (
+            await ctx.ui.input(
+              "Paste Auth Token from https://freebuff.llm.pm:",
+              "Paste token here"
+            )
+          )?.trim();
+          if (inputToken) {
+            const savedKey = saveAuthToken(inputToken);
+            pool.addToken(inputToken);
+            ctx.ui.notify(
+              `Token saved as [${savedKey}]! Pool now has ${pool.size} account(s).`,
+              "info"
+            );
+          }
+        } else {
+          ctx.ui.notify(
+            "Login at https://freebuff.llm.pm then run /freebuff add <token>",
+            "info"
+          );
+        }
+        return;
+      }
+
+      // 3. Subcommand: /freebuff rotate
+      if (sub === "rotate") {
+        const rotated = pool.rotateNext(true);
+        const newActive = pool.getPoolStatus().find((p) => p.isActive);
+        ctx.ui.notify(
+          rotated
+            ? `Rotated active account to: ${newActive?.name}`
+            : "Could not rotate (need 2+ healthy accounts in pool).",
+          "info"
+        );
+        return;
+      }
+
+      // 4. Subcommand: /freebuff list or status
       const poolStatus = pool.getPoolStatus();
       const activeAccount = poolStatus.find((p) => p.isActive);
       const activeClient = primaryEntry?.client;
@@ -929,7 +1057,9 @@ export default async function (pi: ExtensionAPI) {
       }
 
       if (ctx.hasUI) {
-        const menuOptions: string[] = [];
+        const menuOptions: string[] = [
+          "+ Add Auth Token / Login (freebuff.llm.pm)",
+        ];
         if (pool.size > 1) {
           menuOptions.push("Rotate to next account");
         }
@@ -937,7 +1067,26 @@ export default async function (pi: ExtensionAPI) {
         menuOptions.push("Close");
 
         const choice = await ctx.ui.select("Freebuff Status & Options:", menuOptions);
-        if (choice === "Rotate to next account") {
+        if (choice === "+ Add Auth Token / Login (freebuff.llm.pm)") {
+          ctx.ui.notify(
+            "Login Link: https://freebuff.llm.pm\nLog in with your account to get your token.",
+            "info"
+          );
+          const inputToken = (
+            await ctx.ui.input(
+              "Paste Auth Token here:",
+              "Paste token here"
+            )
+          )?.trim();
+          if (inputToken) {
+            const savedKey = saveAuthToken(inputToken);
+            pool.addToken(inputToken);
+            ctx.ui.notify(
+              `Token saved as [${savedKey}]! Pool now has ${pool.size} account(s).`,
+              "info"
+            );
+          }
+        } else if (choice === "Rotate to next account") {
           const rotated = pool.rotateNext(true);
           const newActive = pool.getPoolStatus().find((p) => p.isActive);
           ctx.ui.notify(
