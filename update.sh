@@ -2,7 +2,17 @@
 set -e
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CREDS_FILE="$HOME/.config/manicode/credentials.json"
+
+# Detect if run under sudo and resolve real user
+if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+  REAL_HOME=$(eval echo "~$SUDO_USER")
+  export HOME="$REAL_HOME"
+  export PATH="$PATH:$REAL_HOME/.npm-global/bin"
+  CREDS_FILE="$REAL_HOME/.config/manicode/credentials.json"
+else
+  export PATH="$PATH:$HOME/.npm-global/bin"
+  CREDS_FILE="$HOME/.config/manicode/credentials.json"
+fi
 
 echo "=== pi-freebuff Updater ==="
 
@@ -43,9 +53,7 @@ fi
 # 3. Verify Token
 TOKEN_EXISTS=$(node -e '
   const fs = require("fs");
-  const path = require("path");
-  const os = require("os");
-  const credPath = path.join(os.homedir(), ".config", "manicode", "credentials.json");
+  const credPath = process.argv[1];
   if (process.env.FREEBUFF_AUTH_TOKEN) { process.exit(0); }
   if (fs.existsSync(credPath)) {
     try {
@@ -54,7 +62,7 @@ TOKEN_EXISTS=$(node -e '
     } catch {}
   }
   process.exit(1);
-' && echo "yes" || echo "no")
+' "$CREDS_FILE" && echo "yes" || echo "no")
 
 if [ "$TOKEN_EXISTS" = "no" ]; then
   echo ">> Warning: No auth token found."
