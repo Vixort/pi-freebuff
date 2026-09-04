@@ -9,21 +9,28 @@ Extension สำหรับเชื่อมต่อ **Freebuff (Codebuff)** 
 - **Zero-Docker / Zero-Daemon:** ทำงานเป็น in-process adapter ขนาดเบาภายใน pi CLI เปิดและปิดตามรอบการใช้งานของ pi ทันที
 - **Auto Auth Token:** ตรวจพบและโหลด `authToken` จาก `~/.config/manicode/credentials.json` ให้อัตโนมัติ (หากเคยล็อกอินผ่าน `freebuff` CLI ไว้แล้ว ไม่ต้องตั้งค่าอะไรเลย)
 - **Auto Model Discovery:** ดึงรายชื่อโมเดลฟรีที่โควต้าของคุณใช้งานได้แบบสดๆ เช่น `deepseek/deepseek-v4-flash`, `mimo/mimo-v2.5`, `upstage/solar-pro4`, `minimax/minimax-m3`
+- **Sticky Token Pool & Auto-Rotation:** รองรับการใส่หลายบัญชีพร้อมกัน โดยระบบจะใช้บัญชีเดิมแบบ **Sticky** (ใช้ต่อเนื่อง 25 ครั้ง หรือ 1 ชั่วโมง) เพื่อจำลองพฤติกรรมคนใช้งานจริง ไม่สลับไปมาถี่ๆ จนผิดธรรมชาติ และสลับไปบัญชีสำรองทันทีหากบัญชีหลักติด Rate Limit หรือโควต้าหมด
 - **Dynamic Session & Model Switching:** จัดการคิว Waiting Room และสลับโมเดลให้อัตโนมัติเบื้องหลัง
 - **คำสั่ง `/freebuff` ใน TUI:** เรียกดูสถานะ, เช็คโควต้าประจำวัน (Quota used/limit), และดูรายการโมเดลได้ตลอดเวลา
 
 ---
 
-## การอัปเดต (Updater Script)
+## การจัดการ Token และอัปเดต (Updater Script)
 
-ในโปรเจกต์นี้มีสคริปต์ `update.sh` สำหรับดึงโค้ดเวอร์ชันล่าสุดและอัปเดต Token ได้อย่างสะดวก:
+ในโปรเจกต์นี้มีสคริปต์ `update.sh` สำหรับจัดการบัญชีและอัปเดต:
 
 ```bash
-# 1. ดึงอัปเดตโค้ดล่าสุดจาก Git และตรวจสอบระบบ
-./update.sh
+# 1. ดูรายการ Token ทั้งหมดที่มีในระบบ
+./update.sh list
 
-# 2. ใส่หรือเปลี่ยน Auth Token ใหม่ได้ในคำสั่งเดียว:
-./update.sh <TOKEN_ใหม่_ของคุณ>
+# 2. ตั้งค่า Token หลัก (Account 1)
+./update.sh <TOKEN_หลัก>
+
+# 3. เพิ่ม Token สำรองเข้า Pool สำหรับสลับใช้งาน (Account 2, 3...)
+./update.sh add <TOKEN_สำรอง>
+
+# 4. ดึงอัปเดตโค้ดล่าสุดจาก Git
+./update.sh
 ```
 
 ---
