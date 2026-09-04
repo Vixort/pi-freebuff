@@ -111,8 +111,17 @@ class CodebuffClient {
 
     if (!res.ok) {
       const errText = await res.text();
-      // If session model mismatch or model locked, delete session and retry once
-      if (retry && (res.status === 409 || errText.includes("model_locked") || errText.includes("session_model_mismatch"))) {
+      // If session model mismatch, model locked, or session superseded/expired, delete session and retry once
+      if (
+        retry &&
+        (res.status === 409 ||
+          res.status === 410 ||
+          res.status === 428 ||
+          errText.includes("model_locked") ||
+          errText.includes("session_model_mismatch") ||
+          errText.includes("session_superseded") ||
+          errText.includes("session_expired"))
+      ) {
         await this.deleteSession();
         await new Promise((r) => setTimeout(r, 400));
         return this.ensureSession(model, false);
@@ -305,18 +314,71 @@ export default async function (pi: ExtensionAPI) {
           delete payload.tools;
           delete payload.tool_choice;
 
-          // 5. Forward to Codebuff
           const isStream = Boolean(payload.stream);
-          const upstreamRes = await fetch(`${CODEBUFF_API_URL}/api/v1/chat/completions`, {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${authToken}`,
-              "Content-Type": "application/json",
-              "User-Agent": USER_AGENT,
-              Accept: isStream ? "text/event-stream" : "application/json",
-            },
-            body: JSON.stringify(payload),
-          });
+          let upstreamRes: Response | null = null;
+
+          // Attempt up to 2 times to automatically handle session invalidation (session_superseded / session_expired)
+          for (let attempt = 0; attempt < 2; attempt++) {
+            // 1. Ensure active session for requested model
+            const instanceId = await client.ensureSession(requestedModel);
+
+            // 2. Start agent run
+            runId = await client.startRun(agentId);
+
+            // 3. Inject metadata
+            payload.codebuff_metadata = {
+              run_id: runId,
+              cost_mode: "free",
+              client_id: Math.random().toString(36).substring(2, 15),
+              freebuff_instance_id: instanceId,
+            };
+
+            // 4. Forward to Codebuff
+            upstreamRes = await fetch(`${CODEBUFF_API_URL}/api/v1/chat/completions`, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${authToken}`,
+                "Content-Type": "application/json",
+                "User-Agent": USER_AGENT,
+                Accept: isStream ? "text/event-stream" : "application/json",
+              },
+              body: JSON.stringify(payload),
+            });
+
+            if (upstreamRes.ok) {
+              break;
+            }
+
+            // Check if error is session-related (session_superseded, session_expired, etc.)
+            const errorClone = upstreamRes.clone();
+            const errText = await errorClone.text();
+
+            if (
+              attempt === 0 &&
+              (upstreamRes.status === 409 ||
+                upstreamRes.status === 410 ||
+                upstreamRes.status === 428 ||
+                errText.includes("session_superseded") ||
+                errText.includes("session_expired") ||
+                errText.includes("session_model_mismatch") ||
+                errText.includes("waiting_room_required") ||
+                errText.includes("model_locked"))
+            ) {
+              if (runId) {
+                await client.finishRun(runId);
+                runId = null;
+              }
+              await client.deleteSession();
+              await new Promise((r) => setTimeout(r, 400));
+              continue;
+            }
+
+            break;
+          }
+
+          if (!upstreamRes) {
+            throw new Error("No response from upstream Codebuff");
+          }
 
           // Forward status and headers
           res.writeHead(upstreamRes.status, {
