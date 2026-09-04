@@ -1,0 +1,11 @@
+{
+  "name": "pi-freebuff",
+  "version": "1.0.0",
+  "description": "Freebuff2API provider extension for pi CLI with dynamic model discovery",
+  "main": "index.ts",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
