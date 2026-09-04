@@ -9,6 +9,7 @@ const USER_AGENT = "ai-sdk/openai-compatible/1.0.25/codebuff";
 
 // Known agent mappings for free models
 const AGENT_MAP: Record<string, string> = {
+  "deepseek/deepseek-v4-flash-0731": "base3-free-deepseek-flash",
   "deepseek/deepseek-v4-flash": "base3-free-deepseek-flash",
   "deepseek/deepseek-v4-pro": "base3-free-deepseek",
   "mimo/mimo-v2.5": "base3-free-mimo",
@@ -21,7 +22,15 @@ const AGENT_MAP: Record<string, string> = {
   "google/gemini-2.5-flash-lite": "file-picker",
 };
 
+const MODEL_ALIASES: Record<string, string> = {
+  "deepseek/deepseek-v4-flash-0731": "deepseek/deepseek-v4-flash",
+  "deepseek-v4-flash-0731": "deepseek/deepseek-v4-flash",
+  "deepseek/deepseek-v4-flash": "deepseek/deepseek-v4-flash",
+  "deepseek-v4-flash": "deepseek/deepseek-v4-flash",
+};
+
 const DEFAULT_MODELS = [
+  "deepseek/deepseek-v4-flash-0731",
   "deepseek/deepseek-v4-flash",
   "mimo/mimo-v2.5",
   "upstage/solar-pro4",
@@ -30,7 +39,8 @@ const DEFAULT_MODELS = [
 ];
 
 const MODEL_DISPLAY_NAMES: Record<string, string> = {
-  "deepseek/deepseek-v4-flash": "DeepSeek V4 Flash 07/31",
+  "deepseek/deepseek-v4-flash-0731": "DeepSeek V4 Flash 07/31",
+  "deepseek/deepseek-v4-flash": "DeepSeek V4 Flash",
   "deepseek/deepseek-v4-pro": "DeepSeek V4 Pro",
   "mimo/mimo-v2.5": "MiMo 2.5",
   "minimax/minimax-m3": "MiniMax M3",
@@ -630,6 +640,7 @@ class TokenPool {
 }
 
 function toModelConfig(id: string) {
+  const isReasoningModel = id.includes("deepseek") || id.includes("glm-5.3");
   const displayName = MODEL_DISPLAY_NAMES[id]
     ? `${MODEL_DISPLAY_NAMES[id]} (Freebuff)`
     : `${id} (Freebuff)`;
@@ -637,14 +648,22 @@ function toModelConfig(id: string) {
   return {
     id,
     name: displayName,
-    reasoning: false,
+    reasoning: isReasoningModel,
+    thinkingLevelMap: isReasoningModel
+      ? {
+          low: "low",
+          medium: "medium",
+          high: "high",
+          max: "max",
+        }
+      : undefined,
     input: ["text" as const, "image" as const],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 128000,
     maxTokens: 8192,
     compat: {
       supportsDeveloperRole: false,
-      supportsReasoningEffort: false,
+      supportsReasoningEffort: isReasoningModel,
       supportsUsageInStreaming: false,
       supportsStore: false,
     },
@@ -682,7 +701,15 @@ export default async function (pi: ExtensionAPI) {
       if (sRes.ok) {
         const sData = (await sRes.json()) as any;
         if (sData.rateLimitsByModel && typeof sData.rateLimitsByModel === "object") {
-          const models = Object.keys(sData.rateLimitsByModel);
+          const models: string[] = [];
+          for (const m of Object.keys(sData.rateLimitsByModel)) {
+            if (m === "deepseek/deepseek-v4-flash") {
+              models.push("deepseek/deepseek-v4-flash-0731");
+              models.push("deepseek/deepseek-v4-flash");
+            } else {
+              models.push(m);
+            }
+          }
           if (models.length > 0) {
             availableModels = models;
           }
@@ -731,11 +758,12 @@ export default async function (pi: ExtensionAPI) {
             console.error("Payload keys:", Object.keys(payload));
             if (payload.tools) console.error("Tools count:", payload.tools.length);
           }
-          const requestedModel = payload.model || "deepseek/deepseek-v4-flash";
-          const agentId = AGENT_MAP[requestedModel] || "base3-free-deepseek-flash";
+          const requestedModel = payload.model || "deepseek/deepseek-v4-flash-0731";
+          const upstreamModel = MODEL_ALIASES[requestedModel] || requestedModel;
+          const agentId = AGENT_MAP[requestedModel] || AGENT_MAP[upstreamModel] || "base3-free-deepseek-flash";
 
           // Inject Buffy system marker
-          const marker = getBuffyMarker(requestedModel);
+          const marker = getBuffyMarker(upstreamModel);
           const messages = Array.isArray(payload.messages) ? payload.messages : [];
           if (messages.length > 0 && messages[0].role === "system") {
             messages[0].content = `${marker}\n\n${messages[0].content}`;
@@ -743,6 +771,7 @@ export default async function (pi: ExtensionAPI) {
             messages.unshift({ role: "system", content: marker });
           }
           payload.messages = messages;
+          payload.model = upstreamModel; // Send upstream-compatible model ID
 
           // Remove stream_options and tools from body (avoid 400/404 from Codebuff)
           delete payload.stream_options;
@@ -763,7 +792,7 @@ export default async function (pi: ExtensionAPI) {
             const currentToken = activeEntry.state.token;
 
             // 1. Ensure active session for requested model
-            const instanceId = await currentClient.ensureSession(requestedModel);
+            const instanceId = await currentClient.ensureSession(upstreamModel);
 
             // 2. Start agent run
             const runId = await currentClient.startRun(agentId);

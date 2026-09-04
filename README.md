@@ -218,7 +218,8 @@ Optional environment variables:
 
 | Model ID | Display Name | Capabilities | Context Window |
 |---|---|:---:|:---:|
-| `deepseek/deepseek-v4-flash` | DeepSeek V4 Flash 07/31 | Text, Code, Reasoning, Tools | 128K |
+| `deepseek/deepseek-v4-flash-0731` | DeepSeek V4 Flash 07/31 (Latest) | Text, Code, Reasoning (Thinking), Tools | 128K |
+| `deepseek/deepseek-v4-flash` | DeepSeek V4 Flash | Text, Code, Reasoning (Thinking), Tools | 128K |
 | `deepseek/deepseek-v4-pro` | DeepSeek V4 Pro | Text, Deep Reasoning | 128K |
 | `mimo/mimo-v2.5` | MiMo 2.5 | Text, Code, Multimodal | 128K |
 | `upstage/solar-pro4` | Solar Pro 4 | Text, High Precision | 128K |
