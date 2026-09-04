@@ -76,7 +76,7 @@ pi install /home/null/Projects/freebufftopi
 
 **หรือติดตั้งผ่าน Git (สำหรับแชร์ให้ผู้อื่น):**
 ```bash
-pi install git:github.com/<username>/pi-freebuff
+pi install git:github.com/Vixort/pi-freebuff
 ```
 
 **หรือทดลองรันชั่วคราว:**
