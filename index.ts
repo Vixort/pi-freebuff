@@ -39,25 +39,40 @@ const MODEL_DISPLAY_NAMES: Record<string, string> = {
   "z-ai/glm-5.3-flash": "GLM 5.3 Flash",
 };
 
-function getAuthToken(): string | null {
-  if (process.env.FREEBUFF_AUTH_TOKEN) {
-    return process.env.FREEBUFF_AUTH_TOKEN.trim();
+function getAuthTokens(): string[] {
+  const tokens: string[] = [];
+  if (process.env.FREEBUFF_AUTH_TOKENS) {
+    tokens.push(
+      ...process.env.FREEBUFF_AUTH_TOKENS.split(",").map((t) => t.trim()).filter(Boolean)
+    );
   }
+  if (process.env.FREEBUFF_AUTH_TOKEN) {
+    const t = process.env.FREEBUFF_AUTH_TOKEN.trim();
+    if (t && !tokens.includes(t)) tokens.push(t);
+  }
+
   const credPath = path.join(os.homedir(), ".config", "manicode", "credentials.json");
   if (fs.existsSync(credPath)) {
     try {
       const data = JSON.parse(fs.readFileSync(credPath, "utf8"));
-      if (data.default?.authToken) {
-        return data.default.authToken.trim();
+      if (Array.isArray(data.tokens)) {
+        for (const t of data.tokens) {
+          if (typeof t === "string" && t.trim() && !tokens.includes(t.trim())) {
+            tokens.push(t.trim());
+          }
+        }
       }
       for (const key of Object.keys(data)) {
-        if (data[key]?.authToken) {
-          return data[key].authToken.trim();
+        const val = data[key];
+        if (val && typeof val === "object" && val.authToken) {
+          const t = String(val.authToken).trim();
+          if (t && !tokens.includes(t)) tokens.push(t);
         }
       }
     } catch {}
   }
-  return null;
+
+  return tokens;
 }
 
 function getBuffyMarker(model: string): string {
@@ -238,7 +253,7 @@ interface SessionCache {
 class CodebuffClient {
   private currentSession: SessionCache | null = null;
 
-  constructor(private token: string) {}
+  constructor(public readonly token: string) {}
 
   async deleteSession(): Promise<void> {
     try {
@@ -357,6 +372,129 @@ class CodebuffClient {
   }
 }
 
+interface TokenState {
+  token: string;
+  name: string;
+  client: CodebuffClient;
+  requestCount: number;
+  lastUsed: number;
+  cooldownUntil: number;
+  isBanned: boolean;
+}
+
+class TokenPool {
+  private pool: TokenState[] = [];
+  private activeIndex = 0;
+  // Sticky parameters: rotate after 25 requests or 1 hour
+  private switchAfterRequests = 25;
+  private switchAfterDurationMs = 60 * 60 * 1000;
+  private activeStartedAt = Date.now();
+
+  constructor(tokens: string[]) {
+    this.pool = tokens.map((token, i) => ({
+      token,
+      name: `Account ${i + 1} (${token.slice(0, 6)}...)`,
+      client: new CodebuffClient(token),
+      requestCount: 0,
+      lastUsed: 0,
+      cooldownUntil: 0,
+      isBanned: false,
+    }));
+  }
+
+  get size(): number {
+    return this.pool.length;
+  }
+
+  getActive(): { state: TokenState; client: CodebuffClient } | null {
+    if (this.pool.length === 0) return null;
+    const now = Date.now();
+    let current = this.pool[this.activeIndex];
+
+    // Check sticky rotation (time-based or request-based)
+    const shouldRotate =
+      this.pool.length > 1 &&
+      (current.requestCount >= this.switchAfterRequests ||
+        now - this.activeStartedAt > this.switchAfterDurationMs);
+
+    if (shouldRotate || current.isBanned || current.cooldownUntil > now) {
+      this.rotateNext();
+      current = this.pool[this.activeIndex];
+    }
+
+    if (current.isBanned || current.cooldownUntil > now) {
+      const healthyIdx = this.pool.findIndex(
+        (p) => !p.isBanned && p.cooldownUntil <= now
+      );
+      if (healthyIdx !== -1) {
+        this.activeIndex = healthyIdx;
+        current = this.pool[this.activeIndex];
+      }
+    }
+
+    current.requestCount++;
+    current.lastUsed = now;
+    return { state: current, client: current.client };
+  }
+
+  rotateNext(manual = false): boolean {
+    if (this.pool.length <= 1) return false;
+    const now = Date.now();
+    for (let i = 1; i <= this.pool.length; i++) {
+      const idx = (this.activeIndex + i) % this.pool.length;
+      const candidate = this.pool[idx];
+      if (manual || (!candidate.isBanned && candidate.cooldownUntil <= now)) {
+        this.activeIndex = idx;
+        this.activeStartedAt = now;
+        candidate.requestCount = 0;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  setActive(index: number): boolean {
+    if (index >= 0 && index < this.pool.length) {
+      this.activeIndex = index;
+      this.activeStartedAt = Date.now();
+      this.pool[index].requestCount = 0;
+      return true;
+    }
+    return false;
+  }
+
+  markCooldown(token: string, durationMs = 30 * 60 * 1000): void {
+    const item = this.pool.find((p) => p.token === token);
+    if (item) {
+      item.cooldownUntil = Date.now() + durationMs;
+      this.rotateNext();
+    }
+  }
+
+  markBanned(token: string): void {
+    const item = this.pool.find((p) => p.token === token);
+    if (item) {
+      item.isBanned = true;
+      this.rotateNext();
+    }
+  }
+
+  getPoolStatus() {
+    const now = Date.now();
+    return this.pool.map((p, idx) => ({
+      index: idx,
+      name: p.name,
+      token: p.token,
+      isActive: idx === this.activeIndex,
+      isBanned: p.isBanned,
+      inCooldown: p.cooldownUntil > now,
+      cooldownMinutes:
+        p.cooldownUntil > now ? Math.ceil((p.cooldownUntil - now) / 60000) : 0,
+      requests: p.requestCount,
+    }));
+  }
+}
+
 function toModelConfig(id: string) {
   const displayName = MODEL_DISPLAY_NAMES[id]
     ? `${MODEL_DISPLAY_NAMES[id]} (Freebuff)`
@@ -380,41 +518,44 @@ function toModelConfig(id: string) {
 }
 
 export default async function (pi: ExtensionAPI) {
-  const authToken = getAuthToken();
-  if (!authToken) {
+  const authTokens = getAuthTokens();
+  if (authTokens.length === 0) {
     pi.on("session_start", (_event, ctx) => {
       ctx.ui.notify(
-        "Freebuff: No auth token found! Run `freebuff` CLI once or set FREEBUFF_AUTH_TOKEN.",
+        "Freebuff: No auth token found! Run `./update.sh <TOKEN>` or set FREEBUFF_AUTH_TOKEN.",
         "warning"
       );
     });
     return;
   }
 
-  const client = new CodebuffClient(authToken);
+  const pool = new TokenPool(authTokens);
+  const primaryEntry = pool.getActive();
 
-  // Discover available models from session or use defaults
+  // Discover available models from primary session or use defaults
   let availableModels = DEFAULT_MODELS;
-  try {
-    const sRes = await fetch(`${CODEBUFF_API_URL}/api/v1/freebuff/session`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${authToken}`,
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-      },
-      body: "{}",
-    });
-    if (sRes.ok) {
-      const sData = (await sRes.json()) as any;
-      if (sData.rateLimitsByModel && typeof sData.rateLimitsByModel === "object") {
-        const models = Object.keys(sData.rateLimitsByModel);
-        if (models.length > 0) {
-          availableModels = models;
+  if (primaryEntry) {
+    try {
+      const sRes = await fetch(`${CODEBUFF_API_URL}/api/v1/freebuff/session`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${primaryEntry.state.token}`,
+          "Content-Type": "application/json",
+          "User-Agent": USER_AGENT,
+        },
+        body: "{}",
+      });
+      if (sRes.ok) {
+        const sData = (await sRes.json()) as any;
+        if (sData.rateLimitsByModel && typeof sData.rateLimitsByModel === "object") {
+          const models = Object.keys(sData.rateLimitsByModel);
+          if (models.length > 0) {
+            availableModels = models;
+          }
         }
       }
-    }
-  } catch {}
+    } catch {}
+  }
 
   // Start in-process ephemeral HTTP server
   const server = http.createServer(async (req, res) => {
@@ -449,7 +590,7 @@ export default async function (pi: ExtensionAPI) {
       });
 
       req.on("end", async () => {
-        let runId: string | null = null;
+        let activeRunInfo: { client: CodebuffClient; runId: string } | null = null;
         try {
           const payload = JSON.parse(bodyData);
           if (process.env.DEBUG_FREEBUFF) {
@@ -459,13 +600,7 @@ export default async function (pi: ExtensionAPI) {
           const requestedModel = payload.model || "deepseek/deepseek-v4-flash";
           const agentId = AGENT_MAP[requestedModel] || "base3-free-deepseek-flash";
 
-          // 1. Ensure active session for requested model
-          const instanceId = await client.ensureSession(requestedModel);
-
-          // 2. Start agent run
-          runId = await client.startRun(agentId);
-
-          // 3. Inject Buffy system marker
+          // Inject Buffy system marker
           const marker = getBuffyMarker(requestedModel);
           const messages = Array.isArray(payload.messages) ? payload.messages : [];
           if (messages.length > 0 && messages[0].role === "system") {
@@ -475,29 +610,30 @@ export default async function (pi: ExtensionAPI) {
           }
           payload.messages = messages;
 
-          // 4. Inject metadata
-          payload.codebuff_metadata = {
-            run_id: runId,
-            cost_mode: "free",
-            client_id: Math.random().toString(36).substring(2, 15),
-            freebuff_instance_id: instanceId,
-          };
-
-          // Remove stream_options (Codebuff rejects it with 400)
+          // Remove stream_options and tools from body (avoid 400/404 from Codebuff)
           delete payload.stream_options;
           delete payload.tools;
           delete payload.tool_choice;
 
           const isStream = Boolean(payload.stream);
           let upstreamRes: Response | null = null;
+          let activeEntry = pool.getActive();
 
-          // Attempt up to 2 times to automatically handle session invalidation (session_superseded / session_expired)
+          if (!activeEntry) {
+            throw new Error("No active or healthy Freebuff tokens available in pool");
+          }
+
+          // Attempt up to 2 times to handle session renewal or token failover
           for (let attempt = 0; attempt < 2; attempt++) {
+            const currentClient = activeEntry.client;
+            const currentToken = activeEntry.state.token;
+
             // 1. Ensure active session for requested model
-            const instanceId = await client.ensureSession(requestedModel);
+            const instanceId = await currentClient.ensureSession(requestedModel);
 
             // 2. Start agent run
-            runId = await client.startRun(agentId);
+            const runId = await currentClient.startRun(agentId);
+            activeRunInfo = { client: currentClient, runId };
 
             // 3. Inject metadata
             payload.codebuff_metadata = {
@@ -511,7 +647,7 @@ export default async function (pi: ExtensionAPI) {
             upstreamRes = await fetch(`${CODEBUFF_API_URL}/api/v1/chat/completions`, {
               method: "POST",
               headers: {
-                Authorization: `Bearer ${authToken}`,
+                Authorization: `Bearer ${currentToken}`,
                 "Content-Type": "application/json",
                 "User-Agent": USER_AGENT,
                 Accept: isStream ? "text/event-stream" : "application/json",
@@ -523,28 +659,51 @@ export default async function (pi: ExtensionAPI) {
               break;
             }
 
-            // Check if error is session-related (session_superseded, session_expired, etc.)
+            // Inspect error response
             const errorClone = upstreamRes.clone();
             const errText = await errorClone.text();
 
-            if (
-              attempt === 0 &&
-              (upstreamRes.status === 409 ||
+            if (attempt === 0) {
+              if (activeRunInfo) {
+                await activeRunInfo.client.finishRun(activeRunInfo.runId);
+                activeRunInfo = null;
+              }
+
+              // Check if token banned -> failover to next token!
+              if (upstreamRes.status === 403 && errText.includes("banned")) {
+                pool.markBanned(currentToken);
+                const nextEntry = pool.getActive();
+                if (nextEntry && nextEntry.state.token !== currentToken) {
+                  activeEntry = nextEntry;
+                  continue;
+                }
+              }
+
+              // Check if rate limited -> failover to next token!
+              if (upstreamRes.status === 429 && errText.includes("rate_limited")) {
+                pool.markCooldown(currentToken, 60 * 60 * 1000);
+                const nextEntry = pool.getActive();
+                if (nextEntry && nextEntry.state.token !== currentToken) {
+                  activeEntry = nextEntry;
+                  continue;
+                }
+              }
+
+              // Check if session invalid -> delete session and retry once
+              if (
+                upstreamRes.status === 409 ||
                 upstreamRes.status === 410 ||
                 upstreamRes.status === 428 ||
                 errText.includes("session_superseded") ||
                 errText.includes("session_expired") ||
                 errText.includes("session_model_mismatch") ||
                 errText.includes("waiting_room_required") ||
-                errText.includes("model_locked"))
-            ) {
-              if (runId) {
-                await client.finishRun(runId);
-                runId = null;
+                errText.includes("model_locked")
+              ) {
+                await currentClient.deleteSession();
+                await new Promise((r) => setTimeout(r, 400));
+                continue;
               }
-              await client.deleteSession();
-              await new Promise((r) => setTimeout(r, 400));
-              continue;
             }
 
             break;
@@ -638,10 +797,10 @@ export default async function (pi: ExtensionAPI) {
             try {
               await reader.cancel();
             } catch {}
-            if (runId) {
-              const r = runId;
-              runId = null;
-              await client.finishRun(r);
+            if (activeRunInfo) {
+              const info = activeRunInfo;
+              activeRunInfo = null;
+              await info.client.finishRun(info.runId);
             }
           };
 
@@ -697,8 +856,9 @@ export default async function (pi: ExtensionAPI) {
             await cleanup();
           });
         } catch (err: any) {
-          if (runId) {
-            client.finishRun(runId);
+          if (activeRunInfo) {
+            await activeRunInfo.client.finishRun(activeRunInfo.runId);
+            activeRunInfo = null;
           }
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: { message: err.message || "Internal Proxy Error" } }));
@@ -737,14 +897,25 @@ export default async function (pi: ExtensionAPI) {
 
   // Register /freebuff command for UI
   pi.registerCommand("freebuff", {
-    description: "View Freebuff models, quota, and connection status",
+    description: "View Freebuff status, accounts pool, and models",
     handler: async (_args, ctx) => {
-      const session = client.getSessionCache();
+      const poolStatus = pool.getPoolStatus();
+      const activeAccount = poolStatus.find((p) => p.isActive);
+      const activeClient = primaryEntry?.client;
+      const session = activeClient?.getSessionCache();
+
+      const accountLines = poolStatus.map(
+        (p) =>
+          `[${p.isActive ? "ACTIVE" : "STANDBY"}] ${p.name} - ${p.requests} reqs${
+            p.isBanned ? " (BANNED)" : p.inCooldown ? ` (COOLDOWN ${p.cooldownMinutes}m)` : ""
+          }`
+      );
+
       const infoLines = [
         `Provider: Freebuff (Embedded Native - No Docker)`,
-        `Auth: Token loaded (${authToken.slice(0, 8)}...)`,
-        `Local Port: ${address.port}`,
-        `Available Models: ${availableModels.join(", ")}`,
+        `Token Pool: ${pool.size} account(s) loaded`,
+        ...accountLines,
+        `Active Account: ${activeAccount?.name || "None"}`,
       ];
 
       if (session) {
@@ -758,11 +929,24 @@ export default async function (pi: ExtensionAPI) {
       }
 
       if (ctx.hasUI) {
-        const choice = await ctx.ui.select("Freebuff Status & Models:", [
-          ...availableModels.map((m) => `Switch to: freebuff/${m}`),
-          "Close",
-        ]);
-        if (choice && choice.startsWith("Switch to: ")) {
+        const menuOptions: string[] = [];
+        if (pool.size > 1) {
+          menuOptions.push("Rotate to next account");
+        }
+        menuOptions.push(...availableModels.map((m) => `Switch to: freebuff/${m}`));
+        menuOptions.push("Close");
+
+        const choice = await ctx.ui.select("Freebuff Status & Options:", menuOptions);
+        if (choice === "Rotate to next account") {
+          const rotated = pool.rotateNext(true);
+          const newActive = pool.getPoolStatus().find((p) => p.isActive);
+          ctx.ui.notify(
+            rotated
+              ? `Switched active account to: ${newActive?.name}`
+              : "Could not rotate to another account.",
+            "info"
+          );
+        } else if (choice && choice.startsWith("Switch to: ")) {
           const pickedModel = choice.replace("Switch to: ", "");
           ctx.ui.notify(
             `To use this model, run:\npi --model ${pickedModel}\nor select it via /model`,
