@@ -161,6 +161,115 @@ To call any tool, use the standard DSML tool format:
 </｜｜DSML｜｜tool_calls>`;
 }
 
+function extractToolCallsFromText(rawText: string): {
+  cleanText: string;
+  toolCalls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }>;
+} {
+  const toolCalls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> = [];
+
+  // Match any block starting with <*DSML*...> or <toolcall> or <tool_call> or <invocation>
+  const blockRegex =
+    /(?:<[|｜]+DSML[|｜]+[^>]*>|<toolcall>|<tool_call>|<invocation[^>]*>)([\s\S]*?)(?:<\/[|｜]+DSML[|｜]+[^>]*>|<\/toolcall>|<\/tool_call>|<\/invocation>|$)/gi;
+
+  let blockMatch: RegExpExecArray | null;
+  while ((blockMatch = blockRegex.exec(rawText)) !== null) {
+    const inner = blockMatch[1].trim();
+    if (!inner) continue;
+
+    // 1. Check if there is an explicit invoke / invocation tag
+    const invokeRegex =
+      /<(?:[|｜]+DSML[|｜]+)?(?:invoke|invocation)\s+name="([^"]+)"(?:\s+[^>]*)?>([\s\S]*?)(?:<\/(?:[|｜]+DSML[|｜]+)?(?:invoke|invocation)>|$)/gi;
+    let invMatch: RegExpExecArray | null;
+    let foundInvoke = false;
+
+    while ((invMatch = invokeRegex.exec(inner)) !== null) {
+      foundInvoke = true;
+      const toolName = invMatch[1].trim();
+      const body = invMatch[2];
+      const args: Record<string, any> = {};
+
+      const pRegex =
+        /<(?:[|｜]+DSML[|｜]+)?(?:parameter|param)\s+name="([^"]+)"(?:\s+[^>]*)?>([\s\S]*?)(?:<\/(?:[|｜]+DSML[|｜]+)?(?:parameter|param)>|$)/gi;
+      let p: RegExpExecArray | null;
+      while ((p = pRegex.exec(body)) !== null) {
+        const pName = p[1].trim();
+        const pVal = p[2].trim();
+        try {
+          if (
+            (pVal.startsWith("{") && pVal.endsWith("}")) ||
+            (pVal.startsWith("[") && pVal.endsWith("]"))
+          ) {
+            args[pName] = JSON.parse(pVal);
+          } else {
+            args[pName] = pVal;
+          }
+        } catch {
+          args[pName] = pVal;
+        }
+      }
+
+      const directTags = /<([a-zA-Z0-9_]+)>([\s\S]*?)<\/\1>/gi;
+      let dt: RegExpExecArray | null;
+      while ((dt = directTags.exec(body)) !== null) {
+        if (!["parameter", "param", "invoke", "invocation", "toolcall", "tool_call"].includes(dt[1])) {
+          args[dt[1]] = dt[2].trim();
+        }
+      }
+
+      toolCalls.push({
+        id: "call_" + Math.random().toString(36).substring(2, 11),
+        type: "function",
+        function: {
+          name: toolName,
+          arguments: JSON.stringify(args),
+        },
+      });
+    }
+
+    // 2. If no invoke tag was found, check direct parameter tags (like <command>...</command> -> bash)
+    if (!foundInvoke) {
+      const cmdMatch = /<command>([\s\S]*?)<\/command>/i.exec(inner);
+      if (cmdMatch) {
+        toolCalls.push({
+          id: "call_" + Math.random().toString(36).substring(2, 11),
+          type: "function",
+          function: {
+            name: "bash",
+            arguments: JSON.stringify({ command: cmdMatch[1].trim() }),
+          },
+        });
+      } else {
+        const pathMatch = /<path>([\s\S]*?)<\/path>/i.exec(inner);
+        if (pathMatch) {
+          toolCalls.push({
+            id: "call_" + Math.random().toString(36).substring(2, 11),
+            type: "function",
+            function: {
+              name: "read",
+              arguments: JSON.stringify({ path: pathMatch[1].trim() }),
+            },
+          });
+        }
+      }
+    }
+  }
+
+  // Deduplicate identical consecutive tool calls if model hallucinated/repeated
+  const uniqueToolCalls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> = [];
+  for (const tc of toolCalls) {
+    const isDup = uniqueToolCalls.some(
+      (u) => u.function.name === tc.function.name && u.function.arguments === tc.function.arguments
+    );
+    if (!isDup) uniqueToolCalls.push(tc);
+  }
+
+  // Extract clean text (text before the first tool call block)
+  const firstBlockIdx = rawText.search(/(?:<[|｜]+DSML[|｜]+|<toolcall|<tool_call|<invocation)/i);
+  const cleanText = firstBlockIdx !== -1 ? rawText.slice(0, firstBlockIdx).trim() : rawText.trim();
+
+  return { cleanText, toolCalls: uniqueToolCalls };
+}
+
 class DSMLStreamTransformer {
   private inDSML = false;
   private dsmlBuffer = "";
@@ -197,7 +306,7 @@ class DSMLStreamTransformer {
     }
 
     const combined = this.carry + text;
-    const dsmlMatch = /<[|｜]+DSML[|｜]+tool_calls>/i.exec(combined);
+    const dsmlMatch = /(?:<[|｜]+DSML[|｜]+|<toolcall|<tool_call|<invocation)/i.exec(combined);
 
     if (dsmlMatch) {
       this.inDSML = true;
@@ -243,62 +352,19 @@ class DSMLStreamTransformer {
       this.carry = "";
     }
 
-    if (this.inDSML || /<[|｜]+DSML[|｜]+tool_calls>/i.test(this.dsmlBuffer)) {
-      const match = /<[|｜]+DSML[|｜]+tool_calls>([\s\S]*?)(?:<\/[|｜]+DSML[|｜]+tool_calls>|$)/i.exec(this.dsmlBuffer);
-      if (match) {
-        const dsmlContent = match[1];
-        const invokeRegex = /<[|｜]+DSML[|｜]+invoke\s+name="([^"]+)">([\s\S]*?)(?:<\/[|｜]+DSML[|｜]+invoke>|$)/gi;
-        let invMatch;
-        const toolCalls: any[] = [];
-        let idx = 0;
-
-        while ((invMatch = invokeRegex.exec(dsmlContent)) !== null) {
-          const toolName = invMatch[1].trim();
-          const paramsContent = invMatch[2];
-          const paramRegex = /<[|｜]+DSML[|｜]+parameter\s+name="([^"]+)"(?:\s+[^>]*)?>([\s\S]*?)(?:<\/[|｜]+DSML[|｜]+parameter>|$)/gi;
-          let pMatch;
-          const args: Record<string, any> = {};
-
-          while ((pMatch = paramRegex.exec(paramsContent)) !== null) {
-            const paramName = pMatch[1].trim();
-            const paramValue = pMatch[2].trim();
-            try {
-              if (
-                (paramValue.startsWith("{") && paramValue.endsWith("}")) ||
-                (paramValue.startsWith("[") && paramValue.endsWith("]"))
-              ) {
-                args[paramName] = JSON.parse(paramValue);
-              } else {
-                args[paramName] = paramValue;
-              }
-            } catch {
-              args[paramName] = paramValue;
-            }
-          }
-
-          toolCalls.push({
-            index: idx++,
-            id: "call_" + Math.random().toString(36).substring(2, 11),
-            type: "function",
-            function: {
-              name: toolName,
-              arguments: JSON.stringify(args),
-            },
-          });
-        }
-
-        if (toolCalls.length > 0) {
-          const chunk = {
-            id: this.id,
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
-            model: this.model,
-            choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: "tool_calls" }],
-          };
-          this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-          this.res.write("data: [DONE]\n\n");
-          return;
-        }
+    if (this.inDSML || /(?:<[|｜]+DSML[|｜]+|<toolcall|<tool_call|<invocation)/i.test(this.dsmlBuffer)) {
+      const { toolCalls } = extractToolCallsFromText(this.dsmlBuffer);
+      if (toolCalls.length > 0) {
+        const chunk = {
+          id: this.id,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: this.model,
+          choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: "tool_calls" }],
+        };
+        this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        this.res.write("data: [DONE]\n\n");
+        return;
       }
     }
 
@@ -910,62 +976,23 @@ export default async function (pi: ExtensionAPI) {
           if (!isStream) {
             const data = (await upstreamRes.json()) as any;
             const choice = data.choices?.[0];
-            if (choice?.message?.content && /<[|｜]+DSML[|｜]+tool_calls>/i.test(choice.message.content)) {
-              const rawContent = choice.message.content;
-              const match = /<[|｜]+DSML[|｜]+tool_calls>([\s\S]*?)(?:<\/[|｜]+DSML[|｜]+tool_calls>|$)/i.exec(rawContent);
-              if (match) {
-                const dsmlContent = match[1];
-                const preText = rawContent.slice(0, match.index).trim();
-                const invokeRegex = /<[|｜]+DSML[|｜]+invoke\s+name="([^"]+)">([\s\S]*?)(?:<\/[|｜]+DSML[|｜]+invoke>|$)/gi;
-                let invMatch;
-                const toolCalls: any[] = [];
-                let idx = 0;
-
-                while ((invMatch = invokeRegex.exec(dsmlContent)) !== null) {
-                  const toolName = invMatch[1].trim();
-                  const paramsContent = invMatch[2];
-                  const paramRegex = /<[|｜]+DSML[|｜]+parameter\s+name="([^"]+)"(?:\s+[^>]*)?>([\s\S]*?)(?:<\/[|｜]+DSML[|｜]+parameter>|$)/gi;
-                  let pMatch;
-                  const args: Record<string, any> = {};
-
-                  while ((pMatch = paramRegex.exec(paramsContent)) !== null) {
-                    const paramName = pMatch[1].trim();
-                    const paramValue = pMatch[2].trim();
-                    try {
-                      if (
-                        (paramValue.startsWith("{") && paramValue.endsWith("}")) ||
-                        (paramValue.startsWith("[") && paramValue.endsWith("]"))
-                      ) {
-                        args[paramName] = JSON.parse(paramValue);
-                      } else {
-                        args[paramName] = paramValue;
-                      }
-                    } catch {
-                      args[paramName] = paramValue;
-                    }
-                  }
-
-                  toolCalls.push({
-                    index: idx++,
-                    id: "call_" + Math.random().toString(36).substring(2, 11),
-                    type: "function",
-                    function: {
-                      name: toolName,
-                      arguments: JSON.stringify(args),
-                    },
-                  });
-                }
-
-                if (toolCalls.length > 0) {
-                  choice.message.content = preText || null;
-                  choice.message.tool_calls = toolCalls;
-                  choice.finish_reason = "tool_calls";
-                }
+            if (
+              choice?.message?.content &&
+              /(?:<[|｜]+DSML[|｜]+|<toolcall|<tool_call|<invocation)/i.test(choice.message.content)
+            ) {
+              const { cleanText, toolCalls } = extractToolCallsFromText(choice.message.content);
+              if (toolCalls.length > 0) {
+                choice.message.content = cleanText || null;
+                choice.message.tool_calls = toolCalls;
+                choice.finish_reason = "tool_calls";
               }
             }
             res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
             res.end(JSON.stringify(data));
-            if (runId) await client.finishRun(runId);
+            if (activeRunInfo) {
+              await activeRunInfo.client.finishRun(activeRunInfo.runId);
+              activeRunInfo = null;
+            }
             return;
           }
 
