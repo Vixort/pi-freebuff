@@ -1,155 +1,239 @@
+<div align="center">
+
+<img src="assets/banner.png" alt="pi-freebuff banner" width="100%" />
+
 # pi-freebuff
 
-Extension สำหรับเชื่อมต่อ **Freebuff (Codebuff)** เข้ากับ **pi CLI** แบบ **Embedded Native (All-in-One)** โดย **ไม่ต้องใช้ Docker, ไม่ต้องลง Go และไม่มี Background Service ภายนอก**
+**High-performance, Zero-Docker embedded provider bridge connecting Freebuff (Codebuff) AI models directly into pi coding agent CLI with native tool calling and enterprise-grade stealth protection.**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows%20%7C%20macOS-informational)](#cross-platform-manager)
+[![Runtime](https://img.shields.io/badge/Node.js-%3E%3D18.0.0-brightgreen)](#)
+[![pi CLI](https://img.shields.io/badge/pi%20CLI-Compatible-purple)](https://github.com/earendil-works/pi-coding-agent)
+
+[Features](#-key-features) • [Architecture](#-architecture--logic) • [Quick Start](#-quick-start) • [Anti-Ban Shield](#-5-layer-anti-ban--stealth-shield) • [TUI Manager](#-tui-manager--cli) • [Documentation](#-configuration)
+
+</div>
 
 ---
 
-## จุดเด่น (Highlights)
+## 🚀 Key Features
 
-- **Zero-Docker / Zero-Daemon:** ทำงานเป็น in-process adapter ขนาดเบาภายใน pi CLI เปิดและปิดตามรอบการใช้งานของ pi ทันที
-- **Auto Auth Token:** ตรวจพบและโหลด `authToken` จาก `~/.config/manicode/credentials.json` ให้อัตโนมัติ (หากเคยล็อกอินผ่าน `freebuff` CLI ไว้แล้ว ไม่ต้องตั้งค่าอะไรเลย)
-- **Auto Model Discovery:** ดึงรายชื่อโมเดลฟรีที่โควต้าของคุณใช้งานได้แบบสดๆ เช่น `deepseek/deepseek-v4-flash`, `mimo/mimo-v2.5`, `upstage/solar-pro4`, `minimax/minimax-m3`
-- **Sticky Token Pool & Auto-Rotation:** รองรับการใส่หลายบัญชีพร้อมกัน โดยระบบจะใช้บัญชีเดิมแบบ **Sticky** (ใช้ต่อเนื่อง 25 ครั้ง หรือ 1 ชั่วโมง) เพื่อจำลองพฤติกรรมคนใช้งานจริง ไม่สลับไปมาถี่ๆ จนผิดธรรมชาติ และสลับไปบัญชีสำรองทันทีหากบัญชีหลักติด Rate Limit หรือโควต้าหมด
-- **Dynamic Session & Model Switching:** จัดการคิว Waiting Room และสลับโมเดลให้อัตโนมัติเบื้องหลัง
-- **คำสั่ง `/freebuff` ใน TUI:** 
-  - เพิ่มหรือสลับ Token ได้ใน TUI ทันที
-  - เรียกดูสถานะ Token Pool, เช็คโควต้าประจำวัน (Quota used/limit), และดูรายการโมเดลได้ตลอดเวลา
+- **Zero-Docker & Zero-Daemon:** Runs as an ultra-lightweight, in-process ephemeral adapter inside `pi CLI`. Starts instantly and shuts down cleanly with your session. No background daemons, no Go runtime, and no port collisions.
+- **Native Tool Calling (DSML Stream Parser):** DeepSeek models on Freebuff emit tool invocations in native DSML/XML format. Our real-time streaming parser transparently converts DSML into standard OpenAI Function Calling, allowing `pi` to execute `bash`, `read`, `write`, and `edit` in your local environment.
+- **Sticky Multi-Account Pool:** Rotate multiple Freebuff accounts smoothly. Uses a human-like "sticky" strategy (maintains the same account for 1 hour or 25 requests) to eliminate suspicious IP-to-token flapping.
+- **Auto-Discovery & Zero-Config:** Instantly discovers your existing credentials from `~/.config/manicode/credentials.json` (created by the official Freebuff CLI). Zero manual copy-pasting required.
+- **Dynamic Model Catalog:** Syncs models directly from Codebuff, including **DeepSeek V4 Flash 07/31**, **MiMo 2.5**, and **Solar Pro 4**.
+- **Interactive Cross-Platform TUI Manager:** Manage accounts, auto-update, troubleshoot cloud sessions, and verify models across Linux, Windows, and macOS with `./manage.sh` or `manage.cmd`.
 
 ---
 
-## คำสั่งใน pi CLI (`/freebuff`)
+## 🏛 Architecture & Logic
 
-คุณสามารถจัดการบัญชี Freebuff ได้โดยตรงจากหน้าต่าง pi CLI:
+Traditional third-party proxies require compiling separate Go binaries or running bulky Docker containers that expose open listening ports. **`pi-freebuff`** adopts an in-process adapter pattern:
 
-- `/freebuff` : เปิดเมนูควบคุม (มีปุ่มกดเพิ่ม Token, สลับบัญชี, ดูโควต้า และเลือกโมเดล)
-- `/freebuff login` : แสดงลิงก์ล็อกอิน [freebuff.llm.pm](https://freebuff.llm.pm) และเปิดกล่องข้อความให้วาง Token ทันที
-- `/freebuff add <TOKEN>` : เพิ่ม Token ใหม่เข้า Token Pool ทันที
-- `/freebuff rotate` : บังคับสลับไปใช้บัญชีถัดไปใน Pool ทันที
-- `/model` : สลับโมเดลที่ต้องการใช้งาน (เช่น DeepSeek V4 Flash 07/31, MiMo 2.5, Solar Pro 4)
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                 pi CLI                                  │
+│                                                                         │
+│   ┌─────────────────────┐               ┌───────────────────────────┐   │
+│   │   pi Agent Core     │               │  Embedded Native Adapter  │   │
+│   │ (OpenAI-compatible) │ ──(HTTP req)─►│ (127.0.0.1:ephemeral_port)│   │
+│   └─────────────────────┘               └─────────────┬─────────────┘   │
+└───────────────────────────────────────────────────────┼─────────────────┘
+                                                        │ HTTPS (TLS)
+                                                        │ Vercel AI SDK Spec
+                                                        ▼
+                                       ┌──────────────────────────────────┐
+                                       │   https://www.codebuff.com       │
+                                       │    - Waiting Room Session        │
+                                       │    - Agent Run Lifecycle         │
+                                       │    - Streaming Completions       │
+                                       └──────────────────────────────────┘
+```
 
-- **5-Layer Anti-Ban Protection (เกราะป้องกันบัญชี 5 ชั้น):**
-  1. **Proactive Quota Guard:** ตรวจจับโควต้าที่เหลือและสลับบัญชีล่วงหน้าก่อนชนเพดาน 429
-  2. **Humanized Jitter & Pacing:** หน่วงเวลาแบบสุ่ม 250ms - 550ms เมื่อมีคำขอถี่ๆ ติดกัน เลียนแบบการพิมพ์ของมนุษย์
-  3. **Graceful Session Cleanup:** ส่ง `DELETE` คืน Session ห้องรออัตโนมัติเมื่อปิด pi หรือสลับบัญชี
-  4. **Circuit Breaker:** พักบัญชีทันที 60 นาทีหากพบความผิดปกติ ไม่ยิงกระหน่ำซ้ำบัญชีเดิม
-  5. **HTTP / WARP Proxy Support:** รองรับการมุด IP ผ่าน `FREEBUFF_HTTP_PROXY`
+### Request & Tool-Execution Lifecycle
 
----
+When you prompt `pi`, the adapter manages the proprietary Codebuff handshake seamlessly behind the scenes:
 
-## Configuration (ตัวเลือกเสริม)
-
-สามารถกำหนด Environment Variables เพิ่มเติมได้:
-
-- `FREEBUFF_HTTP_PROXY`: URL ของ Proxy (เช่น `http://127.0.0.1:7890` หรือ Cloudflare WARP)
-- `FREEBUFF_AUTH_TOKENS`: รายการ Auth Token หลายบัญชีคั่นด้วยจุลภาค (เช่น `token1,token2`)
-
----
-
-## การจัดการ Token และระบบ (Cross-Platform TUI Manager)
-
-โปรเจกต์นี้มีระบบจัดการและอัปเดตแบบ **Interactive TUI** ที่รองรับทั้ง **Windows, Linux และ macOS**:
-
-### วิธีเปิดหน้าต่างเมนู TUI:
-- **Linux / macOS:** `./manage.sh`
-- **Windows (Command Prompt):** `manage.cmd`
-- **Windows (PowerShell):** `.\manage.ps1`
-- **หรือใช้ npm:** `npm run manage` (หรือ `npm run update`)
-
-เมื่อเปิดขึ้นมาจะมีเมนู TUI ให้เลือกด้วยปุ่มลูกศร ↑ / ↓ หรือกดตัวเลข:
-1. `Full Auto Update (Git Pull + Verify with pi)` — ดึงโค้ดล่าสุดและตรวจสอบกับ pi อัตโนมัติ
-2. `Pull Latest Code (git pull)` — ดึงโค้ดล่าสุดจาก Git เท่านั้น
-3. `View Token Pool Status` — ตรวจสอบบัญชีทั้งหมดใน Pool
-4. `Add New Token to Pool` — เพิ่ม Token บัญชีสำรอง
-5. `Set / Replace Primary Token` — ตั้งค่าหรือเปลี่ยน Token หลัก
-6. `Verify & List Models in pi CLI` — ตรวจสอบการลงทะเบียนโมเดลใน pi
-7. `Clear / Reset Stale Cloud Sessions` — เคลียร์ Session ค้างบนเซิร์ฟเวอร์
-8. `Help & Troubleshooting` — คู่มือช่วยเหลือและแก้ปัญหา Error
-9. `Uninstall / Remove pi-freebuff from pi CLI` — ถอนการติดตั้งออกจาก pi CLI
-10. `Exit` — ออกจากเมนู
-
-### หรือใช้งานผ่านคำสั่งด่วน (Command Line):
-```bash
-# ดูรายการ Token ทั้งหมดที่มีในระบบ
-./manage.sh list
-
-# ตั้งค่า Token หลัก
-./manage.sh <TOKEN_หลัก>
-
-# เพิ่ม Token สำรองเข้า Pool
-./manage.sh add <TOKEN_สำรอง>
-
-# ดูคู่มือช่วยเหลือและเช็คการเชื่อมต่อ
-./manage.sh help
-
-# ถอนการติดตั้งออกจาก pi CLI
-./manage.sh uninstall
+```
+User Prompt
+    │
+    ▼
+[pi CLI Engine]
+    │  Injects local tools & system prompt
+    ▼
+[Embedded Adapter]
+    │  1. Attaches or refreshes active Waiting Room session
+    │  2. Starts upstream Agent Run (`/api/v1/agent-runs`)
+    │  3. Strips unsupported top-level fields (prevents 404/400 rejections)
+    │  4. Injects CLI stealth metadata & "You are Buffy" marker
+    ▼
+[codebuff.com Upstream]
+    │  DeepSeek generates reasoning & DSML tool call:
+    │  `<｜DSML｜tool_calls><｜DSML｜invoke name="bash">...`
+    ▼
+[Streaming DSML Parser]
+    │  Intercepts `<｜DSML｜...>` tokens in SSE chunks in real-time
+    │  Translates DSML into standard OpenAI `delta.tool_calls`
+    ▼
+[pi CLI Executes Tool]
+    │  Runs local bash / file edit, captures stdout
+    ▼
+[Next Turn with Tool Result]
+    │  Tool result (`role: "tool"`) streamed back upstream
+    ▼
+[Final Assistant Response Displayed]
 ```
 
 ---
 
-## วิธีติดตั้งและใช้งาน
+## 🛡️ 5-Layer Anti-Ban & Stealth Shield
 
-### 1. ติดตั้ง Extension เข้า pi CLI
+Freebuff monitors incoming traffic for abnormal scraper/bot behavior. `pi-freebuff` includes a comprehensive defense system engineered to keep your tokens safe:
 
-เลือกวิธีใดวิธีหนึ่ง:
-
-**ติดตั้งจากโฟลเดอร์นี้ในเครื่อง:**
-```bash
-pi install /home/null/Projects/freebufftopi
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         5-LAYER DEFENSE SHIELD                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│ [1] Proactive Quota Guard   ► Rotates account before hitting 429 quota  │
+│ [2] Humanized Jitter/Pacer  ► 250ms - 550ms micro-delays on rapid bursts│
+│ [3] Sticky Session Affinity ► 1 hour / 25 reqs per token (No IP hopping)│
+│ [4] Clean Cloud Teardown    ► Sends DELETE /session on exit (No ghosts) │
+│ [5] Upstream Proxy Routing  ► Supports Cloudflare WARP & HTTP proxies   │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-**หรือติดตั้งผ่าน Git (สำหรับแชร์ให้ผู้อื่น):**
+1. **Proactive Quota Guard:** Upstream returns `recentCount` and `limit` in every session handshake. When an account reaches 90% of its daily quota (`recentCount >= limit - 0.5`), the adapter smoothly switches to a standby account *before* hitting a 429 Rate Limit error that could flag the account.
+2. **Humanized Jitter & Pacing:** Rapid tool execution loops (which can fire within 10ms) are a major red flag for WAFs. The built-in `RequestPacer` injects randomized 250ms–550ms micro-delays between burst turns, mimicking realistic human reading/typing pauses.
+3. **Sticky Token Rotation:** Rather than rotating accounts per request (which causes suspicious IP-to-account correlation), accounts stay bound for up to 1 hour or 25 requests before gently handing off to the next account.
+4. **Session Lifecycle Teardown:** Whenever `pi` shuts down, `pi-freebuff` automatically releases all active cloud sessions (`DELETE /api/v1/freebuff/session`). This prevents abandoned sessions that trigger `409 session_superseded`.
+5. **Proxy Support:** Route all upstream traffic through a proxy (e.g., Cloudflare WARP or residential proxies) via `FREEBUFF_HTTP_PROXY`.
+
+---
+
+## 📦 Quick Start
+
+### 1. Install Extension in pi CLI
+
+Install directly from GitHub using `pi` package manager:
+
 ```bash
 pi install git:github.com/Vixort/pi-freebuff
 ```
 
-**หรือทดลองรันชั่วคราว:**
+*(Or test locally without installing: `pi -e ./index.ts`)*
+
+### 2. Acquire Your Auth Token
+
+Choose either option:
+
+- **Option A (Web - Recommended):**
+  Visit **[https://freebuff.llm.pm](https://freebuff.llm.pm)**, log in, and copy your `authToken`.
+- **Option B (Freebuff CLI):**
+  Run `npm i -g freebuff && freebuff`. Log in once—your credentials are saved to `~/.config/manicode/credentials.json` and automatically detected by `pi-freebuff`.
+
+### 3. Add Token & Run
+
+Add your token inside `pi CLI` directly:
+```text
+/freebuff add <YOUR_TOKEN>
+```
+Or via the interactive manager script:
 ```bash
-pi -e ./index.ts
+./manage.sh <YOUR_TOKEN>
+```
+
+Start coding with Freebuff models:
+```bash
+pi --model freebuff/deepseek/deepseek-v4-flash
 ```
 
 ---
 
-### 2. เตรียม Auth Token (ทำเพียงครั้งแรก)
+## 🎮 TUI Manager & CLI
 
-หากคุณเคยติดตั้งและล็อกอิน `freebuff` CLI ไว้แล้ว ตัว extension จะดึง token มาใช้ให้อัตโนมัติโดยที่คุณไม่ต้องทำอะไรเลย
+`pi-freebuff` includes a cross-platform TUI manager (`manage.sh` for Unix, `manage.cmd` / `manage.ps1` for Windows, or `npm run manage`).
 
-หากยังไม่เคยมี token ให้เลือกทำวิธีใดวิธีหนึ่ง:
-- **วิธีที่ 1 (ผ่าน CLI):**
-  ```bash
-  npm i -g freebuff
-  freebuff # ล็อกอินครั้งแรก token จะถูกบันทึกลง ~/.config/manicode/credentials.json
-  ```
-- **วิธีที่ 2 (ผ่าน Environment Variable):**
-  รับ token จาก [freebuff.llm.pm](https://freebuff.llm.pm) แล้วตั้งค่า:
-  ```bash
-  export FREEBUFF_AUTH_TOKEN="<token_ของคุณ>"
-  ```
+Run `./manage.sh` to launch the interactive interface:
 
----
+```text
+╔════════════════════════════════════════════════════════════╗
+║              pi-freebuff Manager & Updater                 ║
+╚════════════════════════════════════════════════════════════╝
+ Platform: linux (x64)  | Config: ~/.config/manicode/credentials.json
 
-### 3. เรียกใช้งานใน pi CLI
+  [1] Full Auto Update (Git Pull + Verify with pi)
+  [2] Pull Latest Code (git pull)
+  [3] View Token Pool Status
+  [4] Add New Token to Pool
+  [5] Set / Replace Primary Token
+  [6] Verify & List Models in pi CLI
+  [7] Clear / Reset Stale Cloud Sessions (Fix 409 errors)
+  [8] Help & Troubleshooting
+  [9] Uninstall / Remove pi-freebuff from pi CLI
+  [10] Exit
+```
 
-- **ดูรายการโมเดลที่ใช้งานได้:**
-  ```bash
-  pi --list-models | grep freebuff
-  ```
+### Command-Line Shortcuts
 
-- **เริ่มสนทนาผ่านโมเดลของ Freebuff:**
-  ```bash
-  pi --model freebuff/deepseek/deepseek-v4-flash
-  ```
-  หรือ:
-  ```bash
-  pi --model freebuff/mimo/mimo-v2.5
-  ```
-
-- **ในหน้าต่าง Interactive TUI:**
-  - พิมพ์ `/model` เพื่อเลือกโมเดลใต้กลุ่ม **Freebuff (Native)**
-  - พิมพ์ `/freebuff` เพื่อดูสถานะเซิร์ฟเวอร์, ดูโควต้าการใช้งาน และคำแนะนำการสลับโมเดล
+```bash
+./manage.sh list          # View all configured accounts & masked tokens
+./manage.sh add <TOKEN>   # Add an additional token to the pool
+./manage.sh reset         # Clear lingering cloud sessions (Fixes 409 errors)
+./manage.sh help          # View troubleshooting guide & server ping test
+./manage.sh uninstall     # Cleanly uninstall from pi CLI settings
+```
 
 ---
 
-## License
+## 💬 In-Session Commands (`/freebuff`)
 
-MIT
+Manage your Freebuff connection directly inside `pi CLI` TUI without leaving your session:
+
+| Command | Action |
+|---|---|
+| `/freebuff` | Open interactive menu (Add token, view quota, rotate account) |
+| `/freebuff login` | Displays login link (`https://freebuff.llm.pm`) and opens prompt to paste token |
+| `/freebuff add <TOKEN>` | Adds a new token to the active pool immediately |
+| `/freebuff rotate` | Force switch to the next standby account in the pool |
+| `/model` | Native pi model selector (select under **Freebuff (Native)** group) |
+
+---
+
+## ⚙️ Configuration
+
+Optional environment variables:
+
+| Variable | Description | Default |
+|---|---|---|
+| `FREEBUFF_AUTH_TOKEN` | Primary auth token (overrides credentials file) | `~/.config/manicode/credentials.json` |
+| `FREEBUFF_AUTH_TOKENS` | Comma-separated list of multiple tokens for pool | None |
+| `FREEBUFF_HTTP_PROXY` | HTTP/HTTPS proxy URL for upstream requests (e.g. `http://127.0.0.1:7890`) | Direct connection |
+| `DEBUG_FREEBUFF` | Enable verbose payload and tool-call debugging | `false` |
+
+---
+
+## 🗺️ Supported Models
+
+| Model ID | Display Name | Capabilities | Context Window |
+|---|---|:---:|:---:|
+| `deepseek/deepseek-v4-flash` | DeepSeek V4 Flash 07/31 | Text, Code, Reasoning, Tools | 128K |
+| `deepseek/deepseek-v4-pro` | DeepSeek V4 Pro | Text, Deep Reasoning | 128K |
+| `mimo/mimo-v2.5` | MiMo 2.5 | Text, Code, Multimodal | 128K |
+| `upstage/solar-pro4` | Solar Pro 4 | Text, High Precision | 128K |
+| `minimax/minimax-m3` | MiniMax M3 | Fast Completions | 128K |
+
+---
+
+## 🤝 Contributing & License
+
+Contributions, bug reports, and feature requests are welcome!
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'feat: add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request to the `dev` branch
+
+Distributed under the **MIT License**. See [`LICENSE`](LICENSE) for details.
