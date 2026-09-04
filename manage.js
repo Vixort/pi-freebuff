@@ -215,7 +215,7 @@ async function actionHelpTroubleshooting() {
   console.log(`${c.bold}1. วิธีรับ Auth Token ใหม่:${c.reset}`);
   console.log(`   - ไปที่เว็บ: ${c.cyan}https://freebuff.llm.pm${c.reset}`);
   console.log(`   - ล็อกอินด้วยบัญชี Freebuff / Google / GitHub แล้วคัดลอก Token`);
-  console.log(`   - นำมาใส่ผ่านเมนูข้อ [4] "Add New Token" หรือรัน: ./managerversion.sh add <TOKEN>\n`);
+  console.log(`   - นำมาใส่ผ่านเมนูข้อ [4] "Add New Token" หรือรัน: ./manage.sh add <TOKEN>\n`);
 
   console.log(`${c.bold}2. การแก้ปัญหา Error ทั่วไป:${c.reset}`);
   console.log(`   ${c.yellow}• Error 403 (banned / account unavailable):${c.reset}`);

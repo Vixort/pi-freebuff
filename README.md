@@ -45,15 +45,15 @@ Extension สำหรับเชื่อมต่อ **Freebuff (Codebuff)** 
 
 ---
 
-## การจัดการ Token และเวอร์ชัน (Cross-Platform TUI Manager)
+## การจัดการ Token และระบบ (Cross-Platform TUI Manager)
 
 โปรเจกต์นี้มีระบบจัดการและอัปเดตแบบ **Interactive TUI** ที่รองรับทั้ง **Windows, Linux และ macOS**:
 
 ### วิธีเปิดหน้าต่างเมนู TUI:
-- **Linux / macOS:** `./managerversion.sh`
-- **Windows (Command Prompt):** `managerversion.cmd`
-- **Windows (PowerShell):** `.\managerversion.ps1`
-- **หรือใช้ npm:** `npm run manager` (หรือ `npm run update`)
+- **Linux / macOS:** `./manage.sh`
+- **Windows (Command Prompt):** `manage.cmd`
+- **Windows (PowerShell):** `.\manage.ps1`
+- **หรือใช้ npm:** `npm run manage` (หรือ `npm run update`)
 
 เมื่อเปิดขึ้นมาจะมีเมนู TUI ให้เลือกด้วยปุ่มลูกศร ↑ / ↓ หรือกดตัวเลข:
 1. `Full Auto Update (Git Pull + Verify with pi)` — ดึงโค้ดล่าสุดและตรวจสอบกับ pi อัตโนมัติ
@@ -70,19 +70,19 @@ Extension สำหรับเชื่อมต่อ **Freebuff (Codebuff)** 
 ### หรือใช้งานผ่านคำสั่งด่วน (Command Line):
 ```bash
 # ดูรายการ Token ทั้งหมดที่มีในระบบ
-./managerversion.sh list
+./manage.sh list
 
 # ตั้งค่า Token หลัก
-./managerversion.sh <TOKEN_หลัก>
+./manage.sh <TOKEN_หลัก>
 
 # เพิ่ม Token สำรองเข้า Pool
-./managerversion.sh add <TOKEN_สำรอง>
+./manage.sh add <TOKEN_สำรอง>
 
 # ดูคู่มือช่วยเหลือและเช็คการเชื่อมต่อ
-./managerversion.sh help
+./manage.sh help
 
 # ถอนการติดตั้งออกจาก pi CLI
-./managerversion.sh uninstall
+./manage.sh uninstall
 ```
 
 ---

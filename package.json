@@ -6,8 +6,8 @@
   "keywords": ["pi-package"],
   "license": "MIT",
   "scripts": {
-    "manager": "node managerversion.js",
-    "update": "node managerversion.js"
+    "manage": "node manage.js",
+    "update": "node manage.js"
   },
   "pi": {
     "extensions": ["./index.ts"]
