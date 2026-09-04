@@ -29,6 +29,16 @@ const DEFAULT_MODELS = [
   "deepseek/deepseek-v4-pro",
 ];
 
+const MODEL_DISPLAY_NAMES: Record<string, string> = {
+  "deepseek/deepseek-v4-flash": "DeepSeek V4 Flash 07/31",
+  "deepseek/deepseek-v4-pro": "DeepSeek V4 Pro",
+  "mimo/mimo-v2.5": "MiMo 2.5",
+  "minimax/minimax-m3": "MiniMax M3",
+  "upstage/solar-pro4": "Solar Pro 4",
+  "z-ai/glm-5.2": "GLM 5.2",
+  "z-ai/glm-5.3-flash": "GLM 5.3 Flash",
+};
+
 function getAuthToken(): string | null {
   if (process.env.FREEBUFF_AUTH_TOKEN) {
     return process.env.FREEBUFF_AUTH_TOKEN.trim();
@@ -348,9 +358,13 @@ class CodebuffClient {
 }
 
 function toModelConfig(id: string) {
+  const displayName = MODEL_DISPLAY_NAMES[id]
+    ? `${MODEL_DISPLAY_NAMES[id]} (Freebuff)`
+    : `${id} (Freebuff)`;
+
   return {
     id,
-    name: `${id} (Freebuff)`,
+    name: displayName,
     reasoning: false,
     input: ["text" as const, "image" as const],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
