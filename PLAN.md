@@ -1,77 +1,55 @@
 # Plan: Anti-Ban & Stealth Protection Architecture for pi-freebuff
 
 ## Context
-ในการใช้งาน Freebuff API มีความเสี่ยงที่บัญชีอาจถูกระงับ (`403 {"status":"banned"}`) หากระบบ Anti-Abuse ของ Codebuff ตรวจพบพฤติกรรมผิดปกติ เช่น:
-1. การยิงคำขอเร็วเกินไปหรือต่อเนื่องโดยไม่มีช่วงหน่วงเวลา (Bot-like burst traffic)
-2. การยิงจนทะลุโควต้าประจำวัน (`429 rate_limited`) ซ้ำๆ จนระบบมองว่าเป็นสแปม
-3. การทิ้ง Session ค้างไว้โดยไม่ปิดอย่างถูกต้อง ทำให้เกิด `session_superseded`
-4. การที่หลายบัญชียิงพร้อมกันจาก IP เดิมด้วยรูปแบบที่ผิดธรรมชาติ
+When utilizing the Freebuff/Codebuff backend, accounts can be flagged or suspended (`403 {"status":"banned"}`) if upstream anti-abuse heuristics detect irregular patterns, such as:
+1. Rapid, burst requests with zero delay (bot-like scraping behavior).
+2. Repeatedly exhausting daily rate-limits (`429 rate_limited`), which triggers spam flags.
+3. Abandoned, lingering cloud sessions causing `409 session_superseded`.
+4. Rapid token hopping across multiple accounts from the exact same IP address.
 
-เป้าหมายคือการสร้าง **5 ชั้นเกราะป้องกัน (5-Layer Anti-Ban Shield)** เข้าไปใน `index.ts` เพื่อให้การใช้งานผ่าน pi CLI ปลอดภัยและดูเหมือนการใช้งานผ่าน Freebuff CLI ตัวจริงมากที่สุด
-
----
-
-## Approach (ระบบป้องกัน 5 ชั้น)
-
-### 1. Proactive Quota Guard (สลับบัญชีก่อนชนเพดาน)
-- เซิร์ฟเวอร์ Codebuff ส่งข้อมูลโควต้ากลับมาใน Session ทุกครั้ง (`recentCount` และ `limit`)
-- **การทำงาน:** เมื่อโควต้าบัญชีปัจจุบันใช้ไปถึง 90% (เช่น `recentCount >= limit - 0.5`) ระบบจะสลับไปบัญชีถัดไปใน Pool ล่วงหน้าทันที **โดยไม่ต้องรอให้เจอ 429 Rate Limit** ซึ่งเป็นตัวกระตุ้นให้เซิร์ฟเวอร์เพ่งเล็งบัญชี
-
-### 2. Humanized Jitter & Request Pacing (หน่วงเวลาสุ่มเสมือนมนุษย์)
-- เมื่อมี Tool Loops ติดต่อกัน (เช่น bash -> read -> edit) การยิงติดๆ กันใน 0-50ms จะถูกตรวจจับได้ง่าย
-- **การทำงาน:** เพิ่ม Micro-Jitter หน่วงเวลาแบบสุ่ม 250ms - 550ms ระหว่าง Request ถี่ๆ เพื่อเลียนแบบพฤติกรรมมนุษย์
-
-### 3. Graceful Session Lifecycle Management (เก็บกวาด Session สะอาดหมดจด)
-- เมื่อ pi ปิดการทำงาน (`session_shutdown`) หรือเมื่อมีการสลับบัญชี:
-- **การทำงาน:** ส่งคำสั่ง `DELETE /api/v1/freebuff/session` เสมอ เพื่อคืนโควต้าห้องรอ ไม่ทิ้ง session ร้างไว้บนคลาวด์จนเกิด `session_superseded` ในรอบถัดไป
-
-### 4. Circuit Breaker & Progressive Cooldown (ตัดวงจรเมื่อบัญชีสะดุด)
-- หากบัญชีใดเริ่มมีสัญญาณเตือน (เช่น เจอ 429 หรือ Waiting Room Queued):
-- **การทำงาน:** พักบัญชีนั้นทันที 60 นาที (Cooldown) และสลับไปบัญชีอื่นทันที **ห้ามยิงกระหน่ำซ้ำบัญชีเดิมเด็ดขาด** เพื่อป้องกันไม่ให้ความผิดพลาดธรรมดาบานปลายกลายเป็น Hard Ban
-
-### 5. HTTP Proxy Support (รองรับการมุด IP / Cloudflare WARP)
-- เพิ่มตัวเลือก `FREEBUFF_HTTP_PROXY` / `HTTP_PROXY`:
-- **การทำงาน:** หากผู้ใช้ระบุ Proxy ตัว Extension จะส่งคำขอผ่าน Proxy Agent (ใช้ `undici.ProxyAgent` หรือ `node:https`) เพื่อให้ผู้ใช้สามารถเปลี่ยน IP หรือใช้ WARP ได้อย่างอิสระ
+The goal is to implement a **5-Layer Anti-Ban Shield** directly inside `index.ts` so that interactions via `pi CLI` closely emulate official Freebuff CLI and human developer usage.
 
 ---
 
-## Files to Modify
-- `index.ts`:
-  - เพิ่ม `ProactiveQuotaGuard` ตรวจสอบ `recentCount` ใน Session
-  - เพิ่ม `HumanizedJitter` (delay สุ่มระหว่าง request)
-  - ปรับปรุง `cleanSessionOnExit` ใน event `session_shutdown`
-  - เพิ่มการรองรับ Proxy Dispatcher สำหรับ outbound fetch
-- `README.md`:
-  - อัปเดตคำแนะนำและตัวเลือก Environment Variables เช่น `FREEBUFF_HTTP_PROXY`
+## Approach (5-Layer Defense Shield)
+
+### 1. Proactive Quota Guard
+- Upstream returns quota metrics (`recentCount` and `limit`) in every session handshake.
+- **Mechanism:** When the active account reaches 90% of its daily quota (`recentCount >= limit - 0.5`), the adapter proactively rotates to a standby account in the pool *before* encountering a 429 Rate Limit error.
+
+### 2. Humanized Jitter & Request Pacing
+- Back-to-back tool execution turns firing within 10ms can trigger WAF alarms.
+- **Mechanism:** The `RequestPacer` injects randomized 250ms–550ms micro-delays between rapid burst turns, mimicking realistic human reading and typing pauses.
+
+### 3. Graceful Session Lifecycle Teardown
+- When `pi CLI` shuts down (`session_shutdown`) or when switching accounts:
+- **Mechanism:** Sends `DELETE /api/v1/freebuff/session` to release the cloud session slot, preventing orphaned sessions and avoiding `409 session_superseded` on the next run.
+
+### 4. Circuit Breaker & Progressive Cooldown
+- If an account encounters rate limits (`429`) or waiting room queues:
+- **Mechanism:** Automatically suspends that token with a 60-minute cooldown and immediately fails over to the next healthy token in the pool, avoiding aggressive retries on exhausted accounts.
+
+### 5. Upstream HTTP / WARP Proxy Support
+- Supports `FREEBUFF_HTTP_PROXY`, `HTTP_PROXY`, and `HTTPS_PROXY`.
+- **Mechanism:** Outbound calls to `codebuff.com` route through Node's `undici.ProxyAgent` when a proxy is configured, allowing users to route through Cloudflare WARP or residential proxies.
+
+---
+
+## Files Modified
+- `index.ts`: Proactive quota guard, pacer, sticky token pool, session teardown, proxy dispatcher.
+- `manage.js`: Cross-platform interactive TUI manager (100% English).
+- `manage.sh` / `manage.cmd` / `manage.ps1`: Shell and batch wrappers.
+- `README.md`: English documentation, architecture diagrams, and banner.
 
 ---
 
 ## Reuse
-- Node.js built-in `node:http`, `node:https`, `crypto`
-- Vercel AI SDK request signature ที่จำลองอย่างสมบูรณ์ใน `index.ts`
-- Token Pool ที่สร้างไว้แล้ว
-
----
-
-## Steps
-
-- [ ] **Step 1: Proactive Quota Guard**
-  - ดึงค่า `rateLimit` จาก session response (`recentCount`, `limit`)
-  - สร้างเงื่อนไขตรวจสอบก่อนส่งคำขอ: ถ้าบัญชีปัจจุบันใกล้เต็มเพดาน ให้เรียก `pool.rotateNext()` สลับไปบัญชีสำรองทันที
-- [ ] **Step 2: Humanized Jitter & Micro-Delays**
-  - คำนวณช่วงเวลาระหว่าง request ล่าสุด ถ้าเร็วกว่า 500ms ให้สุ่ม delay (250-550ms) ก่อนยิง upstream
-- [ ] **Step 3: Comprehensive Session Cleanup**
-  - เพิ่มฟังก์ชันเคลียร์ session ของทุกบัญชีใน pool เมื่อ pi ส่งสัญญาณ `session_shutdown` หรือ `process.on('exit')`
-- [ ] **Step 4: Circuit Breaker & Safety Logging**
-  - ปรับปรุงการจัดการ Error เมื่อเจอสัญญาณ 429/428 ให้ติด cooldown ทันทีและแจ้งเตือนผู้ใช้ใน TUI
-- [ ] **Step 5: Upstream Proxy Support**
-  - รองรับการตั้งค่า `FREEBUFF_HTTP_PROXY` ผ่าน custom fetch dispatcher
-- [ ] **Step 6: Documentation & Verification**
-  - อัปเดต `README.md` และทดสอบ offline verification
+- Node.js native standard library: `node:http`, `node:https`, `node:fs`, `node:path`, `node:os`, `undici.ProxyAgent`.
+- Vercel AI SDK request signatures and official Freebuff CLI credentials format.
 
 ---
 
 ## Verification
-1. ตรวจสอบ Offline ด้วย unit checks: ตรวจสอบว่า `ProactiveQuotaGuard` สลับบัญชีเมื่อ `recentCount >= limit - 0.5`
-2. ทดสอบ Jitter Delay: จำลองยิงคำขอ 2 ครั้งติดกัน ตรวจสอบว่ามี delay เสริมเข้ามาตามที่กำหนด
-3. ทดสอบการปิด Session สะอาดเมื่อ pi ออกจากโปรแกรม
+1. Offline unit verification: Validated that `ProactiveQuotaGuard` rotates before rate-limit thresholds.
+2. Verified that `RequestPacer` inserts natural 250ms–550ms micro-delays between rapid calls.
+3. Verified clean session release (`DELETE`) on process exit.

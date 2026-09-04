@@ -212,27 +212,27 @@ async function actionHelpTroubleshooting() {
   console.log(`${c.cyan}${c.bold}            Freebuff Help & Troubleshooting Guide             ${c.reset}`);
   console.log(`${c.cyan}${c.bold}══════════════════════════════════════════════════════════════${c.reset}\n`);
 
-  console.log(`${c.bold}1. วิธีรับ Auth Token ใหม่:${c.reset}`);
-  console.log(`   - ไปที่เว็บ: ${c.cyan}https://freebuff.llm.pm${c.reset}`);
-  console.log(`   - ล็อกอินด้วยบัญชี Freebuff / Google / GitHub แล้วคัดลอก Token`);
-  console.log(`   - นำมาใส่ผ่านเมนูข้อ [4] "Add New Token" หรือรัน: ./manage.sh add <TOKEN>\n`);
+  console.log(`${c.bold}1. How to obtain a new Auth Token:${c.reset}`);
+  console.log(`   - Visit: ${c.cyan}https://freebuff.llm.pm${c.reset}`);
+  console.log(`   - Sign in with your Freebuff / Google / GitHub account and copy the token`);
+  console.log(`   - Add it via option [4] "Add New Token" or run: ./manage.sh add <TOKEN>\n`);
 
-  console.log(`${c.bold}2. การแก้ปัญหา Error ทั่วไป:${c.reset}`);
+  console.log(`${c.bold}2. Troubleshooting Common Errors:${c.reset}`);
   console.log(`   ${c.yellow}• Error 403 (banned / account unavailable):${c.reset}`);
-  console.log(`     - เกิดจากเซิร์ฟเวอร์ตรวจจับการยิง request ผิดปกติในบัญชีเดิม`);
-  console.log(`     - แก้โดย: ใช้บัญชีสำรองใหม่จาก freebuff.llm.pm แล้วเพิ่มเข้า Pool`);
+  console.log(`     - Triggered when upstream detects abnormal/automated request patterns`);
+  console.log(`     - Resolution: Add a new standby token from freebuff.llm.pm into the pool`);
   console.log(`   ${c.yellow}• Error 429 (rate_limited):${c.reset}`);
-  console.log(`     - โควต้าฟรีประจำวันเต็ม (รีเซ็ตทุก 14:00 น. เวลาไทย / เที่ยงคืนเวลาแปซิฟิก)`);
-  console.log(`     - แก้โดย: เพิ่มบัญชีสำรองอีก 1-2 บัญชีเข้า Pool ระบบจะสลับบัญชีให้อัตโนมัติ`);
+  console.log(`     - Daily free quota exhausted (resets daily at midnight Pacific Time)`);
+  console.log(`     - Resolution: Add 1-2 secondary accounts to the pool; auto-rotation handles it`);
   console.log(`   ${c.yellow}• Error 409 (session_superseded / model_locked):${c.reset}`);
-  console.log(`     - เซิร์ฟเวอร์ยังมี Session เก่าค้างอยู่`);
-  console.log(`     - แก้โดย: เลือกเมนูข้อ [7] "Clear / Reset Stale Cloud Sessions"\n`);
+  console.log(`     - Upstream cloud session is bound to another model or lingering`);
+  console.log(`     - Resolution: Choose menu option [7] "Clear / Reset Stale Cloud Sessions"\n`);
 
-  console.log(`${c.bold}3. การใช้งานใน pi CLI:${c.reset}`);
-  console.log(`   - เปิดเมนูใน pi:   พิมพ์ ${c.cyan}/freebuff${c.reset}`);
-  console.log(`   - สลับโมเดล:       พิมพ์ ${c.cyan}/model${c.reset} แล้วเลือกใต้กลุ่ม Freebuff (Native)`);
-  console.log(`   - สลับบัญชีทันที:  พิมพ์ ${c.cyan}/freebuff rotate${c.reset}`);
-  console.log(`   - เพิ่ม Token ใน pi: พิมพ์ ${c.cyan}/freebuff add <TOKEN>${c.reset}\n`);
+  console.log(`${c.bold}3. Quick Usage in pi CLI:${c.reset}`);
+  console.log(`   - In-session menu:    Type ${c.cyan}/freebuff${c.reset}`);
+  console.log(`   - Switch model:       Type ${c.cyan}/model${c.reset} and pick under Freebuff (Native)`);
+  console.log(`   - Rotate account:     Type ${c.cyan}/freebuff rotate${c.reset}`);
+  console.log(`   - Add token in pi:    Type ${c.cyan}/freebuff add <TOKEN>${c.reset}\n`);
 
   process.stdout.write(`Checking connection to Codebuff servers... `);
   try {
@@ -310,11 +310,11 @@ const MENU_ITEMS = [
   { label: "Set / Replace Primary Token", action: actionSetPrimaryToken },
   { label: "Verify & List Models in pi CLI", action: actionVerifyPi },
   {
-    label: "Clear / Reset Stale Cloud Sessions (แก้ปัญหา Session ค้าง)",
+    label: "Clear / Reset Stale Cloud Sessions (Fix 409 errors)",
     action: actionClearStaleSessions,
   },
   {
-    label: "Help & Troubleshooting (คู่มือช่วยเหลือ & แก้ปัญหา)",
+    label: "Help & Troubleshooting Guide",
     action: actionHelpTroubleshooting,
   },
   {
