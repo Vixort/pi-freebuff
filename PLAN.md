@@ -13,9 +13,10 @@ The goal is to implement a **5-Layer Anti-Ban Shield** directly inside `index.ts
 
 ## Approach (5-Layer Defense Shield)
 
-### 1. Proactive Quota Guard
-- Upstream returns quota metrics (`recentCount` and `limit`) in every session handshake.
-- **Mechanism:** When the active account reaches 90% of its daily quota (`recentCount >= limit - 0.5`), the adapter proactively rotates to a standby account in the pool *before* encountering a 429 Rate Limit error.
+### 1. Proactive Credit Guard (Freebucks Coin System)
+- Freebuff retired the legacy daily quota (`recentCount`/`limit`) in favor of **freebucks coins**: each account has a balance + daily allowance, and every model has a coin price (`freebucks.prices`).
+- The session handshake returns `freebucks.balance`, `freebucks.daily.{granted,remaining,resetsAt}`, and `freebucks.prices`.
+- **Mechanism:** When the active account's remaining coins can no longer afford the requested model's price, the adapter proactively rotates to a standby account in the pool *before* encountering a 429/insufficient-credits error. Legacy `rateLimitsByModel` fields are still honored as a fallback.
 
 ### 2. Humanized Jitter & Request Pacing
 - Back-to-back tool execution turns firing within 10ms can trigger WAF alarms.
@@ -50,6 +51,6 @@ The goal is to implement a **5-Layer Anti-Ban Shield** directly inside `index.ts
 ---
 
 ## Verification
-1. Offline unit verification: Validated that `ProactiveQuotaGuard` rotates before rate-limit thresholds.
+1. Offline unit verification: Validated that `ProactiveCreditGuard` rotates before freebucks are exhausted (with legacy quota fallback).
 2. Verified that `RequestPacer` inserts natural 250ms–550ms micro-delays between rapid calls.
 3. Verified clean session release (`DELETE`) on process exit.
