@@ -222,7 +222,7 @@ async function actionHelpTroubleshooting() {
   console.log(`     - Triggered when upstream detects abnormal/automated request patterns`);
   console.log(`     - Resolution: Add a new standby token from freebuff.llm.pm into the pool`);
   console.log(`   ${c.yellow}• Error 429 (rate_limited):${c.reset}`);
-  console.log(`     - Daily free quota exhausted (resets daily at midnight Pacific Time)`);
+  console.log(`     - Freebucks coin balance/allowance exhausted (resets daily)`);
   console.log(`     - Resolution: Add 1-2 secondary accounts to the pool; auto-rotation handles it`);
   console.log(`   ${c.yellow}• Error 409 (session_superseded / model_locked):${c.reset}`);
   console.log(`     - Upstream cloud session is bound to another model or lingering`);

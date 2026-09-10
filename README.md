@@ -23,7 +23,7 @@
 - **Native Tool Calling (DSML Stream Parser):** DeepSeek models on Freebuff emit tool invocations in native DSML/XML format. Our real-time streaming parser transparently converts DSML into standard OpenAI Function Calling, allowing `pi` to execute `bash`, `read`, `write`, and `edit` in your local environment.
 - **Sticky Multi-Account Pool:** Rotate multiple Freebuff accounts smoothly. Uses a human-like "sticky" strategy (maintains the same account for 1 hour or 25 requests) to eliminate suspicious IP-to-token flapping.
 - **Auto-Discovery & Zero-Config:** Instantly discovers your existing credentials from `~/.config/manicode/credentials.json` (created by the official Freebuff CLI). Zero manual copy-pasting required.
-- **Dynamic Model Catalog:** Syncs models directly from Codebuff, including **DeepSeek V4 Flash 07/31**, **MiMo 2.5**, and **Solar Pro 4**.
+- **Dynamic Model Catalog:** Syncs models directly from Codebuff — the account's `freebucks.prices` table, per-model quotas, and the upstream `free-agents.ts` catalog — so brand-new models (Gemini 3.8, GPT-5.6 Luna, Kimi K3 Eco, Muse Spark, etc.) appear automatically without touching the plugin.
 - **Interactive Cross-Platform TUI Manager:** Manage accounts, auto-update, troubleshoot cloud sessions, and verify models across Linux, Windows, and macOS with `./manage.sh` or `manage.cmd`.
 
 ---
@@ -96,7 +96,7 @@ Freebuff monitors incoming traffic for abnormal scraper/bot behavior. `pi-freebu
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                         5-LAYER DEFENSE SHIELD                          │
 ├─────────────────────────────────────────────────────────────────────────┤
-│ [1] Proactive Quota Guard   ► Rotates account before hitting 429 quota  │
+│ [1] Proactive Credit Guard  ► Rotates account before freebucks run out  │
 │ [2] Humanized Jitter/Pacer  ► 250ms - 550ms micro-delays on rapid bursts│
 │ [3] Sticky Session Affinity ► 1 hour / 25 reqs per token (No IP hopping)│
 │ [4] Clean Cloud Teardown    ► Sends DELETE /session on exit (No ghosts) │
@@ -104,7 +104,7 @@ Freebuff monitors incoming traffic for abnormal scraper/bot behavior. `pi-freebu
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-1. **Proactive Quota Guard:** Upstream returns `recentCount` and `limit` in every session handshake. When an account reaches 90% of its daily quota (`recentCount >= limit - 0.5`), the adapter smoothly switches to a standby account *before* hitting a 429 Rate Limit error that could flag the account.
+1. **Proactive Credit Guard:** Freebuff uses a **freebucks coin system** (the legacy daily quota system was retired). Every session handshake returns your coin balance (`freebucks.balance`), daily allowance (`freebucks.daily`), and a per-model price table (`freebucks.prices`). When an account can no longer afford a model's coin price, the adapter smoothly switches to a standby account *before* hitting a rate-limit error that could flag the account.
 2. **Humanized Jitter & Pacing:** Rapid tool execution loops (which can fire within 10ms) are a major red flag for WAFs. The built-in `RequestPacer` injects randomized 250ms–550ms micro-delays between burst turns, mimicking realistic human reading/typing pauses.
 3. **Sticky Token Rotation:** Rather than rotating accounts per request (which causes suspicious IP-to-account correlation), accounts stay bound for up to 1 hour or 25 requests before gently handing off to the next account.
 4. **Session Lifecycle Teardown:** Whenever `pi` shuts down, `pi-freebuff` automatically releases all active cloud sessions (`DELETE /api/v1/freebuff/session`). This prevents abandoned sessions that trigger `409 session_superseded`.
@@ -193,11 +193,24 @@ Manage your Freebuff connection directly inside `pi CLI` TUI without leaving you
 
 | Command | Action |
 |---|---|
-| `/freebuff` | Open interactive menu (Add token, view quota, rotate account) |
+| `/freebuff` | Open interactive menu (Add token, view freebucks balance, rotate account) |
 | `/freebuff login` | Displays login link (`https://freebuff.llm.pm`) and opens prompt to paste token |
 | `/freebuff add <TOKEN>` | Adds a new token to the active pool immediately |
 | `/freebuff rotate` | Force switch to the next standby account in the pool |
 | `/model` | Native pi model selector (select under **Freebuff (Native)** group) |
+
+---
+
+## 🪙 Freebucks Coin System
+
+Freebuff no longer uses a simple daily request quota — it now runs on **freebucks coins**:
+
+- Each account receives a daily coin allowance plus a persistent balance.
+- Every model has a **coin price** (`freebucks.prices`, e.g. `upstage/solar-pro4` is 0 coins, premium models cost more).
+- The session handshake (`POST /api/v1/freebuff/session`) returns `freebucks.balance`, `freebucks.daily.{granted,remaining,resetsAt}`, and `freebucks.prices`.
+- `pi-freebuff` reads these fields to display your live balance in `/freebuff` and to proactively rotate accounts **before** coins run out (Proactive Credit Guard).
+
+> Note: Viewing your exact balance via the web protocol requires a web Cookie; the embedded adapter reads whatever the Bearer-token session handshake exposes.
 
 ---
 
@@ -216,14 +229,28 @@ Optional environment variables:
 
 ## 🗺️ Supported Models
 
-| Model ID | Display Name | Capabilities | Context Window |
+| Model ID | Display Name | Freebucks | Context Window |
 |---|---|:---:|:---:|
-| `deepseek/deepseek-v4-flash-0731` | DeepSeek V4 Flash 07/31 (Latest) | Text, Code, Reasoning (Thinking), Tools | 128K |
-| `deepseek/deepseek-v4-flash` | DeepSeek V4 Flash | Text, Code, Reasoning (Thinking), Tools | 128K |
-| `deepseek/deepseek-v4-pro` | DeepSeek V4 Pro | Text, Deep Reasoning | 128K |
-| `mimo/mimo-v2.5` | MiMo 2.5 | Text, Code, Multimodal | 128K |
-| `upstage/solar-pro4` | Solar Pro 4 | Text, High Precision | 128K |
-| `minimax/minimax-m3` | MiniMax M3 | Fast Completions | 128K |
+| `upstage/solar-pro4` | Solar Pro 4 | 0 | 128K |
+| `z-ai/glm-5.3-flash` | GLM 5.3 Flash | 5 | 128K |
+| `crof/kimi-k3-eco` | Kimi K3 Eco | 5 | 128K |
+| `mimo/mimo-v2.5` | MiMo 2.5 | 10 | 128K |
+| `meta/muse-spark-1.2-contributor` | Muse Spark 1.2 | 15 | 128K |
+| `meta/muse-spark-1.3-contributor` | Muse Spark 1.3 | 15 | 128K |
+| `openai/gpt-5.6-luna` | GPT-5.6 Luna | 20 | 128K |
+| `openai/gpt-5.6-luna-es` | GPT-5.6 Luna ES | 20 | 128K |
+| `deepseek/deepseek-v4-flash` | DeepSeek V4 Flash | 30 (peak +15) | 128K |
+| `google/gemini-3.8-flash` | Gemini 3.8 Flash | 50 | 128K |
+| `openai/gpt-5.6-luna-max` | GPT-5.6 Luna Max | dynamic | 128K |
+| `deepseek/deepseek-v4-flash-max` | DeepSeek V4 Flash Max | dynamic | 128K |
+| `deepseek/deepseek-v4-pro` | DeepSeek V4 Pro | dynamic | 128K |
+| `deepseek/deepseek-v4-pro-max` | DeepSeek V4 Pro Max | dynamic | 128K |
+| `google/gemini-3.5-flash-lite` | Gemini 3.5 Flash Lite | dynamic | 128K |
+| `google/gemini-3.1-flash-lite` | Gemini 3.1 Flash Lite | dynamic | 128K |
+| `anthropic/claude-fable-5` | Claude Fable 5 | dynamic | 128K |
+| `stealth/ox-alpha` | Ox Alpha | dynamic | 128K |
+
+> Coin prices are per request from a live session and may change (peak pricing applies surcharges). The catalog syncs automatically from the account's `freebucks.prices` table plus the upstream `free-agents.ts` source, so new models appear without updating the plugin. "dynamic" = price not yet observed in a live handshake.
 
 ---
 

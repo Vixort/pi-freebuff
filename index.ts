@@ -8,10 +8,14 @@ const CODEBUFF_API_URL = "https://www.codebuff.com";
 const USER_AGENT = "ai-sdk/openai-compatible/1.0.25/codebuff";
 
 // Known agent mappings for free models
+// Verified base3-free-* agents keep their dedicated mappings; newer/unknown
+// models use the upstream root agent "base2-free" (reference-verified).
 const AGENT_MAP: Record<string, string> = {
   "deepseek/deepseek-v4-flash-0731": "base3-free-deepseek-flash",
   "deepseek/deepseek-v4-flash": "base3-free-deepseek-flash",
+  "deepseek/deepseek-v4-flash-max": "base2-free",
   "deepseek/deepseek-v4-pro": "base3-free-deepseek",
+  "deepseek/deepseek-v4-pro-max": "base2-free",
   "mimo/mimo-v2.5": "base3-free-mimo",
   "minimax/minimax-m3": "base3-free-minimax-m3",
   "upstage/solar-pro4": "base3-free-solar-pro4",
@@ -19,7 +23,18 @@ const AGENT_MAP: Record<string, string> = {
   "z-ai/glm-5.3-flash": "base3-free-glm-5-3-flash",
   "fable/fable-5": "base3-free-fable",
   "ox/ox-alpha": "base3-free-ox-alpha",
+  "stealth/ox-alpha": "base3-free-ox-alpha",
+  "anthropic/claude-fable-5": "base2-free",
   "google/gemini-2.5-flash-lite": "file-picker",
+  "google/gemini-3.8-flash": "base2-free",
+  "google/gemini-3.5-flash-lite": "base2-free",
+  "google/gemini-3.1-flash-lite": "base2-free",
+  "openai/gpt-5.6-luna": "base2-free",
+  "openai/gpt-5.6-luna-es": "base2-free",
+  "openai/gpt-5.6-luna-max": "base2-free",
+  "crof/kimi-k3-eco": "base2-free",
+  "meta/muse-spark-1.2-contributor": "base2-free",
+  "meta/muse-spark-1.3-contributor": "base2-free",
 };
 
 const MODEL_ALIASES: Record<string, string> = {
@@ -32,6 +47,11 @@ const MODEL_ALIASES: Record<string, string> = {
 const DEFAULT_MODELS = [
   "deepseek/deepseek-v4-flash-0731",
   "deepseek/deepseek-v4-flash",
+  "z-ai/glm-5.3-flash",
+  "google/gemini-3.8-flash",
+  "openai/gpt-5.6-luna",
+  "crof/kimi-k3-eco",
+  "meta/muse-spark-1.3-contributor",
   "mimo/mimo-v2.5",
   "upstage/solar-pro4",
   "minimax/minimax-m3",
@@ -41,13 +61,30 @@ const DEFAULT_MODELS = [
 const MODEL_DISPLAY_NAMES: Record<string, string> = {
   "deepseek/deepseek-v4-flash-0731": "DeepSeek V4 Flash 07/31",
   "deepseek/deepseek-v4-flash": "DeepSeek V4 Flash",
+  "deepseek/deepseek-v4-flash-max": "DeepSeek V4 Flash Max",
   "deepseek/deepseek-v4-pro": "DeepSeek V4 Pro",
+  "deepseek/deepseek-v4-pro-max": "DeepSeek V4 Pro Max",
   "mimo/mimo-v2.5": "MiMo 2.5",
   "minimax/minimax-m3": "MiniMax M3",
   "upstage/solar-pro4": "Solar Pro 4",
   "z-ai/glm-5.2": "GLM 5.2",
   "z-ai/glm-5.3-flash": "GLM 5.3 Flash",
+  "google/gemini-3.8-flash": "Gemini 3.8 Flash",
+  "google/gemini-3.5-flash-lite": "Gemini 3.5 Flash Lite",
+  "google/gemini-3.1-flash-lite": "Gemini 3.1 Flash Lite",
+  "openai/gpt-5.6-luna": "GPT-5.6 Luna",
+  "openai/gpt-5.6-luna-es": "GPT-5.6 Luna ES",
+  "openai/gpt-5.6-luna-max": "GPT-5.6 Luna Max",
+  "crof/kimi-k3-eco": "Kimi K3 Eco",
+  "meta/muse-spark-1.2-contributor": "Muse Spark 1.2",
+  "meta/muse-spark-1.3-contributor": "Muse Spark 1.3",
+  "anthropic/claude-fable-5": "Claude Fable 5",
+  "stealth/ox-alpha": "Ox Alpha",
 };
+
+// Authoritative upstream agent -> models catalog (free-agents.ts)
+const FREE_AGENTS_URL =
+  "https://raw.githubusercontent.com/CodebuffAI/codebuff/main/common/src/constants/free-agents.ts";
 
 let cachedDispatcher: any = null;
 let dispatcherChecked = false;
@@ -530,11 +567,31 @@ class DSMLStreamTransformer {
   }
 }
 
+// Freebucks coin system (replaces the legacy daily quota system)
+interface FreebucksDaily {
+  limit?: number; // real-world field name ("granted" kept for compat)
+  granted?: number;
+  remaining?: number;
+  spent?: number;
+  resetAt?: string;
+  resetsAt?: string;
+}
+
+interface FreebucksInfo {
+  balance?: number;
+  daily?: FreebucksDaily;
+  prices?: Record<string, number>;
+  [key: string]: any;
+}
+
 interface SessionCache {
   instanceId: string;
   model: string;
   expiresAt: number;
-  rateLimit?: any;
+  status?: string;
+  freebucks?: FreebucksInfo;
+  rateLimitsByModel?: Record<string, any>;
+  rateLimit?: any; // legacy quota fields (deprecated, kept for backward compat)
 }
 
 class CodebuffClient {
@@ -544,12 +601,16 @@ class CodebuffClient {
 
   async deleteSession(): Promise<void> {
     try {
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${this.token}`,
+        "User-Agent": USER_AGENT,
+      };
+      if (this.currentSession?.instanceId) {
+        headers["x-freebuff-instance-id"] = this.currentSession.instanceId;
+      }
       await safeFetch(`${CODEBUFF_API_URL}/api/v1/freebuff/session`, {
         method: "DELETE",
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          "User-Agent": USER_AGENT,
-        },
+        headers,
       });
     } catch {}
     this.currentSession = null;
@@ -602,11 +663,32 @@ class CodebuffClient {
     }
 
     const data = (await res.json()) as any;
+
+    // Waiting room: session not active yet — return empty id, caller retries
+    const status = String(data.status || "active").toLowerCase();
+    if (status === "queued" || status === "waiting_room" || (status !== "active" && !data.instanceId && !data.instance_id)) {
+      this.currentSession = {
+        instanceId: "",
+        model: data.model || model,
+        expiresAt: now + 5000,
+        status,
+      };
+      return "";
+    }
+
+    const instanceId = data.instanceId || data.instance_id;
+    if (!instanceId) {
+      throw new Error(`Session response missing instanceId: ${JSON.stringify(data).slice(0, 200)}`);
+    }
+
     const expiresAt = data.expiresAt ? Date.parse(data.expiresAt) : now + 3600000;
     this.currentSession = {
-      instanceId: data.instanceId,
+      instanceId,
       model: data.model || model,
       expiresAt,
+      status: "active",
+      freebucks: data.freebucks || undefined,
+      rateLimitsByModel: data.rateLimitsByModel || undefined,
       rateLimit: data.rateLimit,
     };
 
@@ -621,7 +703,7 @@ class CodebuffClient {
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
       },
-      body: JSON.stringify({ action: "START", agentId }),
+      body: JSON.stringify({ action: "START", agentId, ancestorRunIds: [] }),
     });
 
     if (!res.ok) {
@@ -659,6 +741,68 @@ class CodebuffClient {
   }
 }
 
+// ---------- Freebucks (coin) helpers ----------
+
+function getCreditsRemaining(session: SessionCache | null): number | null {
+  const fb = session?.freebucks;
+  if (!fb) return null;
+  const dailyRemaining = fb.daily && typeof fb.daily.remaining === "number" ? fb.daily.remaining : null;
+  const balance = typeof fb.balance === "number" ? fb.balance : null;
+  if (dailyRemaining !== null && balance !== null) return Math.min(dailyRemaining, balance);
+  return dailyRemaining ?? balance;
+}
+
+function getModelPrice(session: SessionCache | null, model: string): number | null {
+  const prices = session?.freebucks?.prices;
+  if (prices && typeof prices[model] === "number") return prices[model];
+  const base = MODEL_ALIASES[model] || model;
+  if (base !== model && prices && typeof prices[base] === "number") return prices[base];
+  return null;
+}
+
+function isNearCreditLimit(session: SessionCache | null, model: string): boolean {
+  const remaining = getCreditsRemaining(session);
+  if (remaining !== null) {
+    const price = getModelPrice(session, model) ?? 0;
+    if (price > 0) return remaining < price;
+    return remaining <= 0;
+  }
+
+  // Legacy per-model quota fallback (rateLimitsByModel / rateLimit)
+  const rlByModel = session?.rateLimitsByModel?.[model] || session?.rateLimitsByModel?.[MODEL_ALIASES[model] || model];
+  const rl = rlByModel || session?.rateLimit;
+  if (rl && typeof rl.limit === "number" && typeof rl.recentCount === "number") {
+    return rl.recentCount >= rl.limit - 0.5;
+  }
+  return false;
+}
+
+function formatCreditsLine(session: SessionCache | null): string | null {
+  const fb = session?.freebucks;
+  if (!fb) {
+    const rl = session?.rateLimit;
+    if (rl && typeof rl.limit === "number") {
+      return `Quota (legacy): ${rl.recentCount ?? 0} / ${rl.limit}`;
+    }
+    return null;
+  }
+  const parts: string[] = [];
+  if (typeof fb.balance === "number") parts.push(`Balance: ${fb.balance}`);
+  if (fb.daily) {
+    const granted =
+      typeof fb.daily.limit === "number"
+        ? fb.daily.limit
+        : typeof fb.daily.granted === "number"
+          ? fb.daily.granted
+          : null;
+    const remaining = typeof fb.daily.remaining === "number" ? fb.daily.remaining : null;
+    if (granted !== null || remaining !== null) {
+      parts.push(`Daily: ${remaining ?? "?"}/${granted ?? "?"}`);
+    }
+  }
+  return parts.length > 0 ? `Credits: ${parts.join(" | ")}` : null;
+}
+
 interface TokenState {
   token: string;
   name: string;
@@ -691,6 +835,12 @@ class TokenPool {
   private switchAfterRequests = 25;
   private switchAfterDurationMs = 60 * 60 * 1000;
   private activeStartedAt = Date.now();
+  // Last model requested, used by the credit guard to look up per-model prices
+  private lastRequestedModel: string | null = null;
+
+  setLastRequestedModel(model: string | null): void {
+    this.lastRequestedModel = model;
+  }
 
   constructor(tokens: string[]) {
     this.pool = tokens.map((token, i) => ({
@@ -746,26 +896,20 @@ class TokenPool {
       current = this.pool[this.activeIndex];
     }
 
-    // Proactive Quota Guard: Check if current token is near its limit
+    // Proactive Credit Guard: Check if current token's freebucks are exhausted for this model
     const currentSession = current.client.getSessionCache();
-    const currentRL = currentSession?.rateLimit;
-    const isNearLimit =
-      currentRL &&
-      typeof currentRL.limit === "number" &&
-      typeof currentRL.recentCount === "number" &&
-      currentRL.recentCount >= currentRL.limit - 0.5;
+    const currentNear = currentSession
+      ? isNearCreditLimit(currentSession, this.lastRequestedModel || "")
+      : false;
 
-    if (isNearLimit && this.pool.length > 1) {
+    if (currentNear && this.pool.length > 1) {
       for (let i = 1; i <= this.pool.length; i++) {
         const nextIdx = (this.activeIndex + i) % this.pool.length;
         const candidate = this.pool[nextIdx];
         const candSession = candidate.client.getSessionCache();
-        const candRL = candSession?.rateLimit;
-        const candNear =
-          candRL &&
-          typeof candRL.limit === "number" &&
-          typeof candRL.recentCount === "number" &&
-          candRL.recentCount >= candRL.limit - 0.5;
+        const candNear = candSession
+          ? isNearCreditLimit(candSession, this.lastRequestedModel || "")
+          : false;
 
         if (!candidate.isBanned && candidate.cooldownUntil <= now && !candNear) {
           this.activeIndex = nextIdx;
@@ -855,11 +999,56 @@ class TokenPool {
   }
 }
 
+// ---------- Model catalog helpers ----------
+
+function prettyModelName(id: string): string {
+  if (MODEL_DISPLAY_NAMES[id]) return MODEL_DISPLAY_NAMES[id];
+  const short = id.split("/").pop() || id;
+  return short
+    .split("[-_.]")
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
+/**
+ * Parse upstream free-agents.ts source into agent -> models[] map.
+ * Handles "agent: new Set([...])" and "agent: [...]" forms.
+ */
+function parseFreeAgents(source: string): Record<string, string[]> {
+  const result: Record<string, string[]> = {};
+  const blockRegex = /['"]([^'"]+)['"]\s*:\s*(?:new\s+Set\(\s*)?\[([^\]]*)\]/g;
+  const itemRegex = /['"]([^'"]+)['"]/g;
+  let block: RegExpExecArray | null;
+  while ((block = blockRegex.exec(source)) !== null) {
+    const agent = block[1];
+    const models: string[] = [];
+    let item: RegExpExecArray | null;
+    while ((item = itemRegex.exec(block[2])) !== null) {
+      if (item[1] && !models.includes(item[1])) models.push(item[1]);
+    }
+    if (models.length > 0) result[agent] = models;
+  }
+  return result;
+}
+
+async function fetchUpstreamCatalog(): Promise<Record<string, string[]> | null> {
+  try {
+    const res = await safeFetch(FREE_AGENTS_URL, {
+      headers: { "User-Agent": USER_AGENT },
+    });
+    if (!res.ok) return null;
+    const text = await res.text();
+    const parsed = parseFreeAgents(text);
+    return Object.keys(parsed).length > 0 ? parsed : null;
+  } catch {}
+  return null;
+}
+
 function toModelConfig(id: string) {
-  const isReasoningModel = id.includes("deepseek") || id.includes("glm-5.3");
-  const displayName = MODEL_DISPLAY_NAMES[id]
-    ? `${MODEL_DISPLAY_NAMES[id]} (Freebuff)`
-    : `${id} (Freebuff)`;
+  const isReasoningModel =
+    id.includes("deepseek") || id.includes("glm-5.3") || id.includes("gpt-5.6");
+  const displayName = `${prettyModelName(id)} (Freebuff)`;
 
   return {
     id,
@@ -916,19 +1105,37 @@ export default async function (pi: ExtensionAPI) {
       });
       if (sRes.ok) {
         const sData = (await sRes.json()) as any;
+
+        // Authoritative base: the account's freebucks price table lists every
+        // purchasable model. Merge in per-model quota entries, then enrich with
+        // the upstream free-agents catalog (agent -> models) for extras.
+        const merged: string[] = [];
+        const push = (m: string) => {
+          if (m && !merged.includes(m)) merged.push(m);
+        };
+
+        const prices = sData.freebucks?.prices;
+        if (prices && typeof prices === "object") {
+          for (const m of Object.keys(prices)) push(m);
+        }
         if (sData.rateLimitsByModel && typeof sData.rateLimitsByModel === "object") {
-          const models: string[] = [];
-          for (const m of Object.keys(sData.rateLimitsByModel)) {
-            if (m === "deepseek/deepseek-v4-flash") {
-              models.push("deepseek/deepseek-v4-flash-0731");
-              models.push("deepseek/deepseek-v4-flash");
-            } else {
-              models.push(m);
-            }
+          for (const m of Object.keys(sData.rateLimitsByModel)) push(m);
+        }
+
+        const catalog = await fetchUpstreamCatalog();
+        if (catalog) {
+          for (const models of Object.values(catalog)) {
+            for (const m of models) push(m);
           }
-          if (models.length > 0) {
-            availableModels = models;
-          }
+        }
+
+        // Legacy alias: expose both ID variants for deepseek-v4-flash
+        if (merged.includes("deepseek/deepseek-v4-flash")) {
+          push("deepseek/deepseek-v4-flash-0731");
+        }
+
+        if (merged.length > 0) {
+          availableModels = merged;
         }
       }
     } catch {}
@@ -996,6 +1203,7 @@ export default async function (pi: ExtensionAPI) {
 
           const isStream = Boolean(payload.stream);
           let upstreamRes: Response | null = null;
+          pool.setLastRequestedModel(upstreamModel);
           let activeEntry = pool.getActive();
 
           if (!activeEntry) {
@@ -1008,7 +1216,18 @@ export default async function (pi: ExtensionAPI) {
             const currentToken = activeEntry.state.token;
 
             // 1. Ensure active session for requested model
-            const instanceId = await currentClient.ensureSession(upstreamModel);
+            let instanceId = await currentClient.ensureSession(upstreamModel);
+
+            // Waiting room: session queued — wait briefly and retry once
+            if (!instanceId) {
+              await new Promise((r) => setTimeout(r, 1500));
+              instanceId = await currentClient.ensureSession(upstreamModel);
+              if (!instanceId) {
+                throw new Error(
+                  "Freebuff waiting room is full for this account. Try again shortly or rotate with /freebuff rotate."
+                );
+              }
+            }
 
             // 2. Start agent run
             const runId = await currentClient.startRun(agentId);
@@ -1106,7 +1325,16 @@ export default async function (pi: ExtensionAPI) {
                   "This Freebuff account has been suspended. Please run `/freebuff` or `./manage.sh add <TOKEN>` to add a new token.";
               } else if (errObj.status === "rate_limited") {
                 errMsg =
-                  "Daily quota reached for this account. Run `/freebuff` to add another account to the pool.";
+                  "Freebucks credit exhausted for this account today. Run `/freebuff` to view your balance or add another account to the pool.";
+              } else if (
+                errObj.status === "insufficient_credits" ||
+                errObj.status === "insufficient_freebucks" ||
+                errText.includes("insufficient_credits") ||
+                errText.includes("insufficient_freebucks")
+              ) {
+                pool.markCooldown(activeEntry.state.token, 60 * 60 * 1000);
+                errMsg =
+                  "Not enough freebucks coins for this model. Run `/freebuff` to view your balance or rotate to another account.";
               }
             } catch {}
 
@@ -1364,14 +1592,14 @@ export default async function (pi: ExtensionAPI) {
         `Active Account: ${activeAccount?.name || "None"}`,
       ];
 
+      const creditsLine = formatCreditsLine(session ?? null);
+      if (creditsLine) {
+        infoLines.push(creditsLine);
+      }
+
       if (session) {
         infoLines.push(`Active Model: ${session.model}`);
         infoLines.push(`Instance ID: ${session.instanceId}`);
-        if (session.rateLimit) {
-          infoLines.push(
-            `Quota: ${session.rateLimit.recentCount ?? 0} / ${session.rateLimit.limit ?? "?"} (${session.rateLimit.poolLabel || "Daily"})`
-          );
-        }
       }
 
       if (ctx.hasUI) {
