@@ -592,6 +592,8 @@ interface SessionCache {
   freebucks?: FreebucksInfo;
   rateLimitsByModel?: Record<string, any>;
   rateLimit?: any; // legacy quota fields (deprecated, kept for backward compat)
+  countryCode?: string;
+  countryBlockReason?: string;
 }
 
 class CodebuffClient {
@@ -642,6 +644,12 @@ class CodebuffClient {
         }
         if (data?.freebucks && this.currentSession) {
           this.currentSession.freebucks = data.freebucks;
+        }
+        if (data?.countryCode && this.currentSession) {
+          this.currentSession.countryCode = data.countryCode;
+        }
+        if (this.currentSession) {
+          this.currentSession.countryBlockReason = data?.countryBlockReason || undefined;
         }
       }
     } catch {}
@@ -742,6 +750,8 @@ class CodebuffClient {
       freebucks: data.freebucks || undefined,
       rateLimitsByModel: data.rateLimitsByModel || undefined,
       rateLimit: data.rateLimit,
+      countryCode: data.countryCode || undefined,
+      countryBlockReason: data.countryBlockReason || undefined,
     };
 
     return this.currentSession.instanceId;
@@ -1652,7 +1662,7 @@ export default async function (pi: ExtensionAPI) {
       // 4. Subcommand: /freebuff list or status
       const poolStatus = pool.getPoolStatus();
       const activeAccount = poolStatus.find((p) => p.isActive);
-      const activeClient = primaryEntry?.client;
+      const activeClient = pool.peekActive()?.client;
       const session = activeClient?.getSessionCache();
 
       const accountLines = poolStatus.map(
@@ -1677,6 +1687,14 @@ export default async function (pi: ExtensionAPI) {
       if (session) {
         infoLines.push(`Active Model: ${session.model}`);
         infoLines.push(`Instance ID: ${session.instanceId}`);
+      }
+
+      // Country restriction warning (e.g. "country_not_allowed" observed on
+      // limited-tier accounts — upstream may restrict or flag these regions)
+      if (session?.countryBlockReason) {
+        infoLines.push(
+          `⚠ Country: ${session.countryCode || "unknown"} (${session.countryBlockReason}) — this account region may be restricted upstream`
+        );
       }
 
       if (ctx.hasUI) {
