@@ -596,8 +596,59 @@ interface SessionCache {
 
 class CodebuffClient {
   private currentSession: SessionCache | null = null;
+  // Timestamp of last real traffic (ensureSession) — heartbeats back off to
+  // avoid firing while an actual chat request is in flight.
+  private lastActivityAt = 0;
+  private heartbeating = false;
 
   constructor(public readonly token: string) {}
+
+  /**
+   * Keep-alive ping mimicking the official desktop client: it sends
+   * GET /freebuff/session with x-freebuff-heartbeat every 45s while a session
+   * is active. Skips when there was recent real traffic or the session is
+   * about to expire naturally. On 4xx the cached session is dropped so the
+   * next request recreates it cleanly.
+   */
+  async heartbeat(): Promise<void> {
+    const session = this.currentSession;
+    if (!session || !session.instanceId) return;
+    const now = Date.now();
+    if (session.expiresAt <= now + 5000) return; // expiring anyway — let it go
+    if (now - this.lastActivityAt < 10000) return; // real traffic recently
+    if (this.heartbeating) return;
+    this.heartbeating = true;
+    try {
+      const res = await safeFetch(`${CODEBUFF_API_URL}/api/v1/freebuff/session`, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          "User-Agent": USER_AGENT,
+          "x-freebuff-heartbeat": "1",
+          "x-freebuff-instance-id": session.instanceId,
+        },
+      });
+      if (!res.ok) {
+        // Session is no longer valid server-side — drop cache so the next
+        // ensureSession() creates a fresh one.
+        this.currentSession = null;
+      } else {
+        const data = (await res.json().catch(() => null)) as any;
+        if (data?.expiresAt) {
+          const exp = Date.parse(data.expiresAt);
+          if (Number.isFinite(exp) && this.currentSession) {
+            this.currentSession.expiresAt = exp;
+          }
+        }
+        if (data?.freebucks && this.currentSession) {
+          this.currentSession.freebucks = data.freebucks;
+        }
+      }
+    } catch {}
+    finally {
+      this.heartbeating = false;
+    }
+  }
 
   async deleteSession(): Promise<void> {
     try {
@@ -618,6 +669,7 @@ class CodebuffClient {
 
   async ensureSession(model: string, retry = true): Promise<string> {
     const now = Date.now();
+    this.lastActivityAt = now;
     if (
       this.currentSession &&
       this.currentSession.model === model &&
@@ -856,6 +908,13 @@ class TokenPool {
 
   get size(): number {
     return this.pool.length;
+  }
+
+  /** Like getActive() but does not count a request (used by heartbeat loop). */
+  peekActive(): { state: TokenState; client: CodebuffClient } | null {
+    if (this.pool.length === 0) return null;
+    const current = this.pool[this.activeIndex];
+    return { state: current, client: current.client };
   }
 
   addToken(token: string, name?: string): TokenState {
@@ -1480,9 +1539,27 @@ export default async function (pi: ExtensionAPI) {
   const address = server.address() as { port: number };
   const proxyBaseUrl = `http://127.0.0.1:${address.port}/v1`;
 
-  // Close server and cleanup sessions on session shutdown
+  // Keep-alive heartbeat: the official desktop client pings its active
+  // session every ~45s (GET /freebuff/session + x-freebuff-heartbeat) to
+  // prevent mid-conversation expiry. Only the active account's session is
+  // pinged, and only if one exists — idle sessions with no traffic create
+  // no heartbeat traffic at all.
+  const HEARTBEAT_INTERVAL_MS = 45_000;
+  const heartbeatTimer = setInterval(async () => {
+    try {
+      const entry = pool.peekActive();
+      await entry?.client.heartbeat();
+    } catch {}
+  }, HEARTBEAT_INTERVAL_MS);
+  // Don't keep the process alive just for the heartbeat (Node only)
+  if (typeof (heartbeatTimer as any)?.unref === "function") {
+    (heartbeatTimer as any).unref();
+  }
+
+  // Stop heartbeat, close server, and release all sessions on shutdown
   pi.on("session_shutdown", async () => {
     try {
+      clearInterval(heartbeatTimer);
       server.close();
       await pool.cleanupAll();
     } catch {}
