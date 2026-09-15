@@ -1743,6 +1743,35 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
+      // 4. Subcommand: /freebuff reset
+      if (sub === "reset") {
+        const activeClient = pool.peekActive()?.client;
+        if (activeClient) {
+          await activeClient.deleteSession();
+          ctx.ui.notify("Active cloud session cleared and reset successfully.", "info");
+        } else {
+          ctx.ui.notify("No active account found to reset.", "warning");
+        }
+        return;
+      }
+
+      // 5. Subcommand: /freebuff help
+      if (sub === "help") {
+        const helpText = [
+          "Freebuff Commands Guide:",
+          "/freebuff             - Open interactive dashboard & model selector",
+          "/freebuff login       - Open login link & prompt to paste token",
+          "/freebuff add <token> - Add an auth token to the account pool",
+          "/freebuff rotate      - Switch to next standby account",
+          "/freebuff status      - View accounts, Freebucks balance & countdown",
+          "/freebuff reset       - Clear active cloud session (fixes 409 errors)",
+          "/freebuff help        - Show this help summary",
+          "/model                - Open pi native model selector",
+        ].join("\n");
+        ctx.ui.notify(helpText, "info");
+        return;
+      }
+
       // 4. Subcommand: /freebuff list or status
       const poolStatus = pool.getPoolStatus();
       const activeAccount = poolStatus.find((p) => p.isActive);
@@ -1798,6 +1827,9 @@ export default async function (pi: ExtensionAPI) {
         if (pool.size > 1) {
           menuOptions.push("Rotate to next account");
         }
+        if (session && session.instanceId) {
+          menuOptions.push("Reset active cloud session (clear lock)");
+        }
         menuOptions.push(...availableModels.map((m) => `Switch to: freebuff/${m}`));
         menuOptions.push("Close");
 
@@ -1830,6 +1862,12 @@ export default async function (pi: ExtensionAPI) {
               : "Could not rotate to another account.",
             "info"
           );
+        } else if (choice === "Reset active cloud session (clear lock)") {
+          const activeClient = pool.peekActive()?.client;
+          if (activeClient) {
+            await activeClient.deleteSession();
+            ctx.ui.notify("Active cloud session cleared successfully.", "info");
+          }
         } else if (choice && choice.startsWith("Switch to: ")) {
           const pickedModel = choice.replace("Switch to: ", "");
           ctx.ui.notify(
