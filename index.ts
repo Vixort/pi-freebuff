@@ -1821,7 +1821,6 @@ export default async function (pi: ExtensionAPI) {
         } else if (ctx.hasUI) {
           await activeClient.fetchSessionInfo();
           const session = activeClient.getSessionCache();
-          const prices = session?.freebucks?.prices || {};
           const balance = session?.freebucks?.balance ?? "?";
 
           const options = availableModels.map((m) => {
@@ -1844,7 +1843,7 @@ export default async function (pi: ExtensionAPI) {
         if (ctx.hasUI && price !== null) {
           const ok = await ctx.ui.confirm(
             "Confirm 1-Hour Rental",
-            `Rent ${prettyModelName(targetModel)} for 1 hour? This will use ${price} Freebucks.`
+            `Rent ${prettyModelName(targetModel)} for 1 hour? Cost: ${price} Freebucks.`
           );
           if (!ok) {
             ctx.ui.notify("Rental cancelled.", "info");
@@ -2001,33 +2000,32 @@ export default async function (pi: ExtensionAPI) {
       }
 
       if (ctx.hasUI) {
-        let menuTitle = `Freebuff [No Session | Select Model to Start]:`;
+        let menuTitle = "Freebuff [No Active Session | Select Model to Start]:";
         const menuOptions: string[] = [];
 
         if (hasActive) {
-          menuTitle = `Freebuff [${prettyModelName(session!.model)}: ${remainingMins}m left]:`;
+          menuTitle = `Freebuff [Active: ${prettyModelName(session!.model)} | ${remainingMins}m left]:`;
           menuOptions.push(
-            `🟢 Active: ${prettyModelName(session!.model)} (${remainingMins}m remaining)`
+            `[Active] ${prettyModelName(session!.model)} (${remainingMins}m remaining)`
           );
-          menuOptions.push("🔄 Switch Model (Rent New 1-Hour Session)");
-          menuOptions.push("🛑 End / Release Current Session");
+          menuOptions.push("[Switch] Rent Different Model (New 1-Hour Session)");
+          menuOptions.push("[End] Release / Cancel Active Session");
         } else {
-          menuOptions.push("🟢 Start 1-Hour Session (Select Model & Rent)");
+          menuOptions.push("[Start] Rent 1-Hour Session (Select Model)");
         }
 
         if (pool.size > 1) {
-          menuOptions.push("Rotate to next account");
+          menuOptions.push("[Rotate] Switch to next standby account");
         }
-        menuOptions.push("📋 View Balance & Accounts Status");
-        menuOptions.push("+ Add Auth Token / Login (freebuff.llm.pm)");
+        menuOptions.push("[Status] View Balance & Accounts Pool");
+        menuOptions.push("[Token] Add Auth Token / Login (freebuff.llm.pm)");
         menuOptions.push("Close");
 
         const choice = await ctx.ui.select(menuTitle, menuOptions);
         if (
-          choice === "🟢 Start 1-Hour Session (Select Model & Rent)" ||
-          choice === "🔄 Switch Model (Rent New 1-Hour Session)"
+          choice &&
+          (choice.startsWith("[Start]") || choice.startsWith("[Switch]"))
         ) {
-          const prices = session?.freebucks?.prices || {};
           const balance = session?.freebucks?.balance ?? "?";
 
           const options = availableModels.map((m) => {
@@ -2058,12 +2056,12 @@ export default async function (pi: ExtensionAPI) {
               ctx.ui.notify(res.message, res.ok ? "info" : "error");
             }
           }
-        } else if (choice === "🛑 End / Release Current Session") {
+        } else if (choice && choice.startsWith("[End]")) {
           if (activeClient) {
             await activeClient.deleteSession();
-            ctx.ui.notify("Active session released.", "info");
+            ctx.ui.notify("Active session released successfully.", "info");
           }
-        } else if (choice === "Rotate to next account") {
+        } else if (choice && choice.startsWith("[Rotate]")) {
           const rotated = pool.rotateNext(true);
           const newActive = pool.getPoolStatus().find((p) => p.isActive);
           ctx.ui.notify(
@@ -2072,9 +2070,9 @@ export default async function (pi: ExtensionAPI) {
               : "Could not rotate to another account.",
             "info"
           );
-        } else if (choice === "📋 View Balance & Accounts Status") {
+        } else if (choice && choice.startsWith("[Status]")) {
           ctx.ui.notify(infoLines.join("\n"), "info");
-        } else if (choice === "+ Add Auth Token / Login (freebuff.llm.pm)") {
+        } else if (choice && choice.startsWith("[Token]")) {
           ctx.ui.notify(
             "Login Link: https://freebuff.llm.pm\nLog in with your account to get your token.",
             "info"
