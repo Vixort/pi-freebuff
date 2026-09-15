@@ -82,6 +82,49 @@ const MODEL_DISPLAY_NAMES: Record<string, string> = {
   "stealth/ox-alpha": "Ox Alpha",
 };
 
+// Official Codebuff context windows (from freebuff-models.ts)
+const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
+  "z-ai/glm-5.3-flash": 1_000_000,
+  "z-ai/glm-5.2": 1_000_000,
+  "deepseek/deepseek-v4-flash-0731": 1_048_576,
+  "deepseek/deepseek-v4-flash": 1_048_576,
+  "deepseek/deepseek-v4-flash-max": 1_048_576,
+  "deepseek/deepseek-v4-pro": 1_048_576,
+  "deepseek/deepseek-v4-pro-max": 1_048_576,
+  "openai/gpt-5.6-luna": 1_000_000,
+  "openai/gpt-5.6-luna-es": 372_000,
+  "openai/gpt-5.6-luna-max": 1_000_000,
+  "meta/muse-spark-1.3-contributor": 1_000_000,
+  "meta/muse-spark-1.2-contributor": 1_000_000,
+  "stealth/ox-alpha": 1_000_000,
+  "ox/ox-alpha": 1_000_000,
+  "anthropic/claude-fable-5": 1_000_000,
+  "google/gemini-3.8-flash": 1_000_000,
+  "google/gemini-2.5-flash-lite": 1_000_000,
+  "google/gemini-3.5-flash-lite": 1_000_000,
+  "google/gemini-3.1-flash-lite": 1_000_000,
+  "upstage/solar-pro4": 500_000,
+  "minimax/minimax-m3": 524_288,
+  "mimo/mimo-v2.5": 262_144,
+  "crof/kimi-k3-eco": 262_144,
+};
+
+const MODEL_MAX_TOKENS: Record<string, number> = {
+  "z-ai/glm-5.3-flash": 65536,
+  "deepseek/deepseek-v4-flash-0731": 16384,
+  "deepseek/deepseek-v4-flash": 16384,
+  "deepseek/deepseek-v4-flash-max": 16384,
+  "deepseek/deepseek-v4-pro": 16384,
+  "deepseek/deepseek-v4-pro-max": 16384,
+  "openai/gpt-5.6-luna": 32768,
+  "openai/gpt-5.6-luna-es": 16384,
+  "openai/gpt-5.6-luna-max": 32768,
+  "upstage/solar-pro4": 16384,
+  "minimax/minimax-m3": 16384,
+  "mimo/mimo-v2.5": 16384,
+  "google/gemini-3.8-flash": 65536,
+};
+
 // Authoritative upstream agent -> models catalog (free-agents.ts)
 const FREE_AGENTS_URL =
   "https://raw.githubusercontent.com/CodebuffAI/codebuff/main/common/src/constants/free-agents.ts";
@@ -1227,9 +1270,20 @@ async function fetchUpstreamCatalog(): Promise<Record<string, string[]> | null> 
 }
 
 function toModelConfig(id: string) {
+  const baseId = MODEL_ALIASES[id] || id;
   const isReasoningModel =
     id.includes("deepseek") || id.includes("glm-5.3") || id.includes("gpt-5.6");
   const displayName = `${prettyModelName(id)} (Freebuff)`;
+
+  const contextWindow =
+    MODEL_CONTEXT_WINDOWS[id] ||
+    MODEL_CONTEXT_WINDOWS[baseId] ||
+    131072;
+
+  const maxTokens =
+    MODEL_MAX_TOKENS[id] ||
+    MODEL_MAX_TOKENS[baseId] ||
+    8192;
 
   return {
     id,
@@ -1245,8 +1299,8 @@ function toModelConfig(id: string) {
       : undefined,
     input: ["text" as const, "image" as const],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 128000,
-    maxTokens: 8192,
+    contextWindow,
+    maxTokens,
     compat: {
       supportsDeveloperRole: false,
       supportsReasoningEffort: isReasoningModel,

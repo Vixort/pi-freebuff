@@ -226,27 +226,23 @@ Optional environment variables:
 
 Coin prices below were observed from a live handshake (they can change; peak pricing adds temporary surcharges). The catalog syncs automatically from `freebucks.prices` + the upstream `free-agents.ts` source, so new models appear without updating the plugin.
 
-| Model ID | Display Name | Freebucks | Context |
-|---|---|:---:|:---:|
-| `upstage/solar-pro4` | Solar Pro 4 | 0 | 128K |
-| `z-ai/glm-5.3-flash` | GLM 5.3 Flash | 5 | 128K |
-| `crof/kimi-k3-eco` | Kimi K3 Eco | 5 | 128K |
-| `mimo/mimo-v2.5` | MiMo 2.5 | 10 | 128K |
-| `meta/muse-spark-1.2-contributor` | Muse Spark 1.2 | 15 | 128K |
-| `meta/muse-spark-1.3-contributor` | Muse Spark 1.3 | 15 | 128K |
-| `openai/gpt-5.6-luna` | GPT-5.6 Luna | 20 | 128K |
-| `openai/gpt-5.6-luna-es` | GPT-5.6 Luna ES | 20 | 128K |
-| `deepseek/deepseek-v4-flash` | DeepSeek V4 Flash | 30 (peak +15) | 128K |
-| `google/gemini-3.8-flash` | Gemini 3.8 Flash | 50 | 128K |
-| `deepseek/deepseek-v4-flash-0731` | DeepSeek V4 Flash 07/31 | alias | 128K |
-| `deepseek/deepseek-v4-flash-max` | DeepSeek V4 Flash Max | dynamic | 128K |
-| `deepseek/deepseek-v4-pro` | DeepSeek V4 Pro | dynamic | 128K |
-| `deepseek/deepseek-v4-pro-max` | DeepSeek V4 Pro Max | dynamic | 128K |
-| `google/gemini-3.5-flash-lite` | Gemini 3.5 Flash Lite | dynamic | 128K |
-| `google/gemini-3.1-flash-lite` | Gemini 3.1 Flash Lite | dynamic | 128K |
-| `openai/gpt-5.6-luna-max` | GPT-5.6 Luna Max | dynamic | 128K |
-| `anthropic/claude-fable-5` | Claude Fable 5 | dynamic | 128K |
-| `stealth/ox-alpha` | Ox Alpha | dynamic | 128K |
+| Model ID | Display Name | Freebucks | Context | Max Output |
+|---|---|:---:|:---:|:---:|
+| `z-ai/glm-5.3-flash` | GLM 5.3 Flash | 5 | 1M (1,000,000) | 65.5K |
+| `crof/kimi-k3-eco` | Kimi K3 Eco | 5 | 262K | 8.2K |
+| `upstage/solar-pro4` | Solar Pro 4 | 10 | 500K | 16.4K |
+| `mimo/mimo-v2.5` | MiMo 2.5 | 10 | 262K | 16.4K |
+| `meta/muse-spark-1.2-contributor` | Muse Spark 1.2 | 15 | 1M | 8.2K |
+| `meta/muse-spark-1.3-contributor` | Muse Spark 1.3 | 15 | 1M | 8.2K |
+| `openai/gpt-5.6-luna` | GPT-5.6 Luna | 20 | 1M | 32.8K |
+| `openai/gpt-5.6-luna-es` | GPT-5.6 Luna ES | 20 | 372K | 16.4K |
+| `deepseek/deepseek-v4-flash` | DeepSeek V4 Flash | 25 (peak +15) | 1M (1,048,576) | 16.4K |
+| `deepseek/deepseek-v4-flash-0731` | DeepSeek V4 Flash 07/31 | alias | 1M (1,048,576) | 16.4K |
+| `deepseek/deepseek-v4-pro` | DeepSeek V4 Pro | dynamic | 1M (1,048,576) | 16.4K |
+| `google/gemini-3.8-flash` | Gemini 3.8 Flash | 50 | 1M | 65.5K |
+| `google/gemini-2.5-flash-lite` | Gemini 2.5 Flash Lite | dynamic | 1M | 8.2K |
+| `stealth/ox-alpha` | Ox Alpha | dynamic | 1M | 16.4K |
+| `anthropic/claude-fable-5` | Claude Fable 5 | dynamic | 1M | 16.4K |
 
 *"dynamic" = price not yet observed in a live handshake; "alias" = alternate ID of the same model.*
 
