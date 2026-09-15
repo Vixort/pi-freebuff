@@ -1783,6 +1783,15 @@ export default async function (pi: ExtensionAPI) {
       }
 
       if (ctx.hasUI) {
+        let menuTitle = "Freebuff Status & Options:";
+        if (session && session.instanceId) {
+          const remainingMinutes = Math.max(
+            0,
+            Math.ceil((session.expiresAt - Date.now()) / 60000)
+          );
+          menuTitle = `Freebuff [${prettyModelName(session.model)}: ${remainingMinutes}m left]:`;
+        }
+
         const menuOptions: string[] = [
           "+ Add Auth Token / Login (freebuff.llm.pm)",
         ];
@@ -1792,7 +1801,7 @@ export default async function (pi: ExtensionAPI) {
         menuOptions.push(...availableModels.map((m) => `Switch to: freebuff/${m}`));
         menuOptions.push("Close");
 
-        const choice = await ctx.ui.select("Freebuff Status & Options:", menuOptions);
+        const choice = await ctx.ui.select(menuTitle, menuOptions);
         if (choice === "+ Add Auth Token / Login (freebuff.llm.pm)") {
           ctx.ui.notify(
             "Login Link: https://freebuff.llm.pm\nLog in with your account to get your token.",
