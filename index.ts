@@ -719,32 +719,44 @@ class CodebuffClient {
     saveSessionDisk(this.token, null);
   }
 
-  async ensureSession(model: string, retry = true): Promise<string> {
+  getActiveSession(targetModel?: string): SessionCache | null {
     const now = Date.now();
-    this.lastActivityAt = now;
-
     if (!this.currentSession) {
       this.currentSession = loadSessionDisk(this.token);
     }
+    if (!this.currentSession || !this.currentSession.instanceId) return null;
+    if (this.currentSession.expiresAt <= now + 15000) {
+      this.currentSession = null;
+      saveSessionDisk(this.token, null);
+      return null;
+    }
+    if (targetModel) {
+      const target = MODEL_ALIASES[targetModel] || targetModel;
+      const current = MODEL_ALIASES[this.currentSession.model] || this.currentSession.model;
+      if (target !== current) return null;
+    }
+    return this.currentSession;
+  }
 
+  async startSession(model: string): Promise<{ ok: boolean; message: string; instanceId?: string }> {
+    const now = Date.now();
     const targetModel = MODEL_ALIASES[model] || model;
-    const currentModel = this.currentSession
-      ? MODEL_ALIASES[this.currentSession.model] || this.currentSession.model
-      : "";
 
-    // If current session is still valid for this model, reuse it directly! Zero credits spent!
-    if (
-      this.currentSession &&
-      currentModel === targetModel &&
-      this.currentSession.expiresAt > now + 15000 &&
-      this.currentSession.instanceId
-    ) {
-      return this.currentSession.instanceId;
+    // Check if session for requested model is already active
+    const active = this.getActiveSession(targetModel);
+    if (active && active.instanceId) {
+      const remainingMins = Math.ceil((active.expiresAt - now) / 60000);
+      return {
+        ok: true,
+        instanceId: active.instanceId,
+        message: `Session is already active for ${prettyModelName(active.model)} (${remainingMins}m remaining).`,
+      };
     }
 
-    // Only delete previous session if it has actually expired:
-    if (this.currentSession && this.currentSession.expiresAt <= now + 15000) {
+    // If an active session exists for another model, release it before renting a new model slot
+    if (this.currentSession && this.currentSession.instanceId && this.currentSession.expiresAt > now + 15000) {
       await this.deleteSession();
+      await new Promise((r) => setTimeout(r, 400));
     }
 
     const res = await safeFetch(`${CODEBUFF_API_URL}/api/v1/freebuff/session`, {
@@ -760,54 +772,21 @@ class CodebuffClient {
 
     if (!res.ok) {
       const errText = await res.text();
-
-      // If model is locked, keep using the existing model session rather than failing!
-      if (errText.includes("model_locked")) {
-        try {
-          const errObj = JSON.parse(errText);
-          if (errObj.currentModel && this.currentSession) {
-            this.currentSession.model = errObj.currentModel;
-            saveSessionDisk(this.token, this.currentSession);
-            return this.currentSession.instanceId;
-          }
-        } catch {}
-      }
-
-      // If session model mismatch, model locked, or session superseded/expired, delete session and retry once
-      if (
-        retry &&
-        (res.status === 409 ||
-          res.status === 410 ||
-          res.status === 428 ||
-          errText.includes("session_model_mismatch") ||
-          errText.includes("session_superseded") ||
-          errText.includes("session_expired"))
-      ) {
-        await this.deleteSession();
-        await new Promise((r) => setTimeout(r, 400));
-        return this.ensureSession(model, false);
-      }
-      throw new Error(`Session error (${res.status}): ${errText}`);
+      let msg = errText;
+      try {
+        const errObj = JSON.parse(errText);
+        msg = errObj.message || errObj.error || errText;
+        if (errObj.freebucksShortfall) {
+          msg = `Not enough Freebucks! Costs ${errObj.freebucksShortfall.price} Freebucks/hr, but you have ${errObj.freebucksShortfall.balance} left.`;
+        }
+      } catch {}
+      return { ok: false, message: `Failed to start session (${res.status}): ${msg}` };
     }
 
     const data = (await res.json()) as any;
-
-    // Waiting room: session not active yet — return empty id, caller retries
-    const status = String(data.status || "active").toLowerCase();
-    if (status === "queued" || status === "waiting_room" || (status !== "active" && !data.instanceId && !data.instance_id)) {
-      this.currentSession = {
-        instanceId: "",
-        model: data.model || targetModel,
-        expiresAt: now + 5000,
-        status,
-      };
-      saveSessionDisk(this.token, this.currentSession);
-      return "";
-    }
-
     const instanceId = data.instanceId || data.instance_id;
     if (!instanceId) {
-      throw new Error(`Session response missing instanceId: ${JSON.stringify(data).slice(0, 200)}`);
+      return { ok: false, message: "Session response missing instanceId" };
     }
 
     const expiresAt = data.expiresAt ? Date.parse(data.expiresAt) : now + 3600000;
@@ -824,7 +803,32 @@ class CodebuffClient {
     };
     saveSessionDisk(this.token, this.currentSession);
 
-    return this.currentSession.instanceId;
+    const mins = Math.ceil((expiresAt - now) / 60000);
+    return {
+      ok: true,
+      instanceId,
+      message: `Started 1-hour session for ${prettyModelName(this.currentSession.model)} (${mins}m remaining)!`,
+    };
+  }
+
+  async ensureSession(model: string): Promise<string> {
+    const targetModel = MODEL_ALIASES[model] || model;
+    const active = this.getActiveSession(targetModel);
+    if (active && active.instanceId) {
+      return active.instanceId;
+    }
+
+    const anyActive = this.getActiveSession();
+    if (anyActive && anyActive.instanceId) {
+      const mins = Math.ceil((anyActive.expiresAt - Date.now()) / 60000);
+      throw new Error(
+        `Active session is locked to ${prettyModelName(anyActive.model)} (${mins}m remaining). Switch to ${anyActive.model} in pi (/model) or run '/freebuff' to start a session for ${prettyModelName(targetModel)}.`
+      );
+    }
+
+    throw new Error(
+      `No active session for ${prettyModelName(targetModel)}. Run '/freebuff' (or '/freebuff start') to select your model and start a 1-hour session.`
+    );
   }
 
   async startRun(agentId: string): Promise<string> {
@@ -1155,6 +1159,29 @@ class TokenPool {
 
 // ---------- Model catalog helpers ----------
 
+function matchModelShortcut(query: string, available: string[]): string | null {
+  const q = query.toLowerCase().trim();
+  const directAliases: Record<string, string> = {
+    glm: "z-ai/glm-5.3-flash",
+    "glm-5.3": "z-ai/glm-5.3-flash",
+    flash: "deepseek/deepseek-v4-flash-0731",
+    "0731": "deepseek/deepseek-v4-flash-0731",
+    deepseek: "deepseek/deepseek-v4-flash-0731",
+    mimo: "mimo/mimo-v2.5",
+    solar: "upstage/solar-pro4",
+    kimi: "crof/kimi-k3-eco",
+    luna: "openai/gpt-5.6-luna",
+    muse: "meta/muse-spark-1.3-contributor",
+    minimax: "minimax/minimax-m3",
+  };
+  if (directAliases[q]) return directAliases[q];
+  const exact = available.find((m) => m.toLowerCase() === q);
+  if (exact) return exact;
+  const partial = available.find((m) => m.toLowerCase().includes(q));
+  if (partial) return partial;
+  return null;
+}
+
 function prettyModelName(id: string): string {
   if (MODEL_DISPLAY_NAMES[id]) return MODEL_DISPLAY_NAMES[id];
   const short = id.split("/").pop() || id;
@@ -1244,18 +1271,16 @@ export default async function (pi: ExtensionAPI) {
   const pacer = new RequestPacer();
   const primaryEntry = pool.getActive();
 
-  // Discover available models from primary session or use defaults
+  // Discover available models and current balance (read-only GET — never auto-starts session)
   let availableModels = DEFAULT_MODELS;
   if (primaryEntry) {
     try {
       const sRes = await safeFetch(`${CODEBUFF_API_URL}/api/v1/freebuff/session`, {
-        method: "POST",
+        method: "GET",
         headers: {
           Authorization: `Bearer ${primaryEntry.state.token}`,
-          "Content-Type": "application/json",
           "User-Agent": USER_AGENT,
         },
-        body: "{}",
       });
       if (sRes.ok) {
         const sData = (await sRes.json()) as any;
@@ -1670,13 +1695,87 @@ export default async function (pi: ExtensionAPI) {
 
   // Register /freebuff command for UI
   pi.registerCommand("freebuff", {
-    description: "Manage Freebuff tokens, rotation, models, and status",
+    description: "Manage Freebuff sessions, model rental, tokens, and status",
     handler: async (args, ctx) => {
       const rawArgs = (args || "").trim();
       const parts = rawArgs.split(/\s+/).filter(Boolean);
       const sub = parts[0]?.toLowerCase();
+      const activeClient = pool.peekActive()?.client;
 
-      // 1. Subcommand: /freebuff add <token>
+      // 1. Subcommand: /freebuff start [model]
+      if (sub === "start") {
+        if (!activeClient) {
+          ctx.ui.notify(
+            "No active account token found. Run /freebuff login first.",
+            "warning"
+          );
+          return;
+        }
+
+        let modelArg = parts.slice(1).join(" ").trim();
+        let targetModel = "";
+
+        if (modelArg) {
+          const matched = matchModelShortcut(modelArg, availableModels);
+          if (!matched) {
+            ctx.ui.notify(
+              `Unknown model "${modelArg}". Available: ${availableModels.join(", ")}`,
+              "warning"
+            );
+            return;
+          }
+          targetModel = matched;
+        } else if (ctx.hasUI) {
+          await activeClient.fetchSessionInfo();
+          const session = activeClient.getSessionCache();
+          const prices = session?.freebucks?.prices || {};
+          const balance = session?.freebucks?.balance ?? "?";
+
+          const options = availableModels.map((m) => {
+            const price = getModelPrice(session ?? null, m);
+            const priceText = price !== null ? `${price} Freebucks/hr` : "Standard";
+            return `${prettyModelName(m)} (${priceText}) -> ${m}`;
+          });
+
+          const choice = await ctx.ui.select(
+            `Select Model to Rent for 1 Hour (Balance: ${balance}):`,
+            [...options, "Cancel"]
+          );
+          if (!choice || choice === "Cancel") return;
+          targetModel = choice.split(" -> ")[1]?.trim() || "";
+        }
+
+        if (!targetModel) return;
+
+        const price = getModelPrice(activeClient.getSessionCache(), targetModel);
+        if (ctx.hasUI && price !== null) {
+          const ok = await ctx.ui.confirm(
+            "Confirm 1-Hour Rental",
+            `Rent ${prettyModelName(targetModel)} for 1 hour? This will use ${price} Freebucks.`
+          );
+          if (!ok) {
+            ctx.ui.notify("Rental cancelled.", "info");
+            return;
+          }
+        }
+
+        const res = await activeClient.startSession(targetModel);
+        ctx.ui.notify(res.message, res.ok ? "info" : "error");
+        return;
+      }
+
+      // 2. Subcommand: /freebuff stop / end / reset
+      if (sub === "stop" || sub === "end" || sub === "reset") {
+        if (activeClient) {
+          await activeClient.deleteSession();
+          ctx.ui.notify("Active cloud session released successfully.", "info");
+        } else {
+          ctx.ui.notify("No active account found.", "warning");
+        }
+        return;
+      }
+
+      // 3. Subcommand: /freebuff add <token>
       if (sub === "add") {
         let tokenToAdd = parts.slice(1).join(" ").trim();
         if (!tokenToAdd && ctx.hasUI) {
@@ -1692,7 +1791,7 @@ export default async function (pi: ExtensionAPI) {
           return;
         }
         const savedKey = saveAuthToken(tokenToAdd);
-        const added = pool.addToken(tokenToAdd);
+        pool.addToken(tokenToAdd);
         ctx.ui.notify(
           `Token saved as [${savedKey}] and added to pool (${pool.size} account(s) ready).`,
           "info"
@@ -1700,7 +1799,7 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      // 2. Subcommand: /freebuff login
+      // 4. Subcommand: /freebuff login
       if (sub === "login") {
         if (ctx.hasUI) {
           ctx.ui.notify(
@@ -1730,7 +1829,7 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      // 3. Subcommand: /freebuff rotate
+      // 5. Subcommand: /freebuff rotate
       if (sub === "rotate") {
         const rotated = pool.rotateNext(true);
         const newActive = pool.getPoolStatus().find((p) => p.isActive);
@@ -1743,40 +1842,36 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      // 4. Subcommand: /freebuff reset
-      if (sub === "reset") {
-        const activeClient = pool.peekActive()?.client;
-        if (activeClient) {
-          await activeClient.deleteSession();
-          ctx.ui.notify("Active cloud session cleared and reset successfully.", "info");
-        } else {
-          ctx.ui.notify("No active account found to reset.", "warning");
-        }
-        return;
-      }
-
-      // 5. Subcommand: /freebuff help
+      // 6. Subcommand: /freebuff help
       if (sub === "help") {
         const helpText = [
           "Freebuff Commands Guide:",
-          "/freebuff             - Open interactive dashboard & model selector",
+          "/freebuff             - Open interactive dashboard & session manager",
+          "/freebuff start       - Open model picker to rent a 1-hour session",
+          "/freebuff start <mdl> - Rent 1-hour session (e.g. glm, 0731, solar)",
+          "/freebuff stop        - Release current cloud session",
+          "/freebuff status      - View accounts, Freebucks balance & countdown",
           "/freebuff login       - Open login link & prompt to paste token",
           "/freebuff add <token> - Add an auth token to the account pool",
           "/freebuff rotate      - Switch to next standby account",
-          "/freebuff status      - View accounts, Freebucks balance & countdown",
-          "/freebuff reset       - Clear active cloud session (fixes 409 errors)",
-          "/freebuff help        - Show this help summary",
           "/model                - Open pi native model selector",
         ].join("\n");
         ctx.ui.notify(helpText, "info");
         return;
       }
 
-      // 4. Subcommand: /freebuff list or status
+      // 7. Subcommand: /freebuff status / list / default interactive menu
+      await activeClient?.fetchSessionInfo();
       const poolStatus = pool.getPoolStatus();
       const activeAccount = poolStatus.find((p) => p.isActive);
-      const activeClient = pool.peekActive()?.client;
       const session = activeClient?.getSessionCache();
+      const now = Date.now();
+      const hasActive = Boolean(
+        session && session.instanceId && session.expiresAt > now + 15000
+      );
+      const remainingMins = hasActive
+        ? Math.max(0, Math.ceil((session!.expiresAt - now) / 60000))
+        : 0;
 
       const accountLines = poolStatus.map(
         (p) =>
@@ -1797,14 +1892,15 @@ export default async function (pi: ExtensionAPI) {
         infoLines.push(creditsLine);
       }
 
-      if (session && session.instanceId) {
-        const remainingMinutes = Math.max(0, Math.ceil((session.expiresAt - Date.now()) / 60000));
-        infoLines.push(`Active Model: ${prettyModelName(session.model)} (${remainingMinutes}m remaining)`);
-        infoLines.push(`Session ID: ${session.instanceId}`);
+      if (hasActive) {
+        infoLines.push(
+          `Active Model: ${prettyModelName(session!.model)} (${remainingMins}m remaining)`
+        );
+        infoLines.push(`Session ID: ${session!.instanceId}`);
+      } else {
+        infoLines.push("Active Session: None (Type /freebuff start to rent a model)");
       }
 
-      // Country restriction warning (e.g. "country_not_allowed" observed on
-      // limited-tier accounts — upstream may restrict or flag these regions)
       if (session?.countryBlockReason) {
         infoLines.push(
           `⚠ Country: ${session.countryCode || "unknown"} (${session.countryBlockReason}) — this account region may be restricted upstream`
@@ -1812,46 +1908,67 @@ export default async function (pi: ExtensionAPI) {
       }
 
       if (ctx.hasUI) {
-        let menuTitle = "Freebuff Status & Options:";
-        if (session && session.instanceId) {
-          const remainingMinutes = Math.max(
-            0,
-            Math.ceil((session.expiresAt - Date.now()) / 60000)
+        let menuTitle = `Freebuff [No Session | Select Model to Start]:`;
+        const menuOptions: string[] = [];
+
+        if (hasActive) {
+          menuTitle = `Freebuff [${prettyModelName(session!.model)}: ${remainingMins}m left]:`;
+          menuOptions.push(
+            `🟢 Active: ${prettyModelName(session!.model)} (${remainingMins}m remaining)`
           );
-          menuTitle = `Freebuff [${prettyModelName(session.model)}: ${remainingMinutes}m left]:`;
+          menuOptions.push("🔄 Switch Model (Rent New 1-Hour Session)");
+          menuOptions.push("🛑 End / Release Current Session");
+        } else {
+          menuOptions.push("🟢 Start 1-Hour Session (Select Model & Rent)");
         }
 
-        const menuOptions: string[] = [
-          "+ Add Auth Token / Login (freebuff.llm.pm)",
-        ];
         if (pool.size > 1) {
           menuOptions.push("Rotate to next account");
         }
-        if (session && session.instanceId) {
-          menuOptions.push("Reset active cloud session (clear lock)");
-        }
-        menuOptions.push(...availableModels.map((m) => `Switch to: freebuff/${m}`));
+        menuOptions.push("📋 View Balance & Accounts Status");
+        menuOptions.push("+ Add Auth Token / Login (freebuff.llm.pm)");
         menuOptions.push("Close");
 
         const choice = await ctx.ui.select(menuTitle, menuOptions);
-        if (choice === "+ Add Auth Token / Login (freebuff.llm.pm)") {
-          ctx.ui.notify(
-            "Login Link: https://freebuff.llm.pm\nLog in with your account to get your token.",
-            "info"
+        if (
+          choice === "🟢 Start 1-Hour Session (Select Model & Rent)" ||
+          choice === "🔄 Switch Model (Rent New 1-Hour Session)"
+        ) {
+          const prices = session?.freebucks?.prices || {};
+          const balance = session?.freebucks?.balance ?? "?";
+
+          const options = availableModels.map((m) => {
+            const price = getModelPrice(session ?? null, m);
+            const priceText = price !== null ? `${price} Freebucks/hr` : "Standard";
+            return `${prettyModelName(m)} (${priceText}) -> ${m}`;
+          });
+
+          const picked = await ctx.ui.select(
+            `Select Model to Rent for 1 Hour (Balance: ${balance}):`,
+            [...options, "Cancel"]
           );
-          const inputToken = (
-            await ctx.ui.input(
-              "Paste Auth Token here:",
-              "Paste token here"
-            )
-          )?.trim();
-          if (inputToken) {
-            const savedKey = saveAuthToken(inputToken);
-            pool.addToken(inputToken);
-            ctx.ui.notify(
-              `Token saved as [${savedKey}]! Pool now has ${pool.size} account(s).`,
-              "info"
-            );
+          if (picked && picked !== "Cancel") {
+            const targetModel = picked.split(" -> ")[1]?.trim();
+            if (targetModel && activeClient) {
+              const price = getModelPrice(session ?? null, targetModel);
+              if (price !== null) {
+                const ok = await ctx.ui.confirm(
+                  "Confirm Rental",
+                  `Rent ${prettyModelName(targetModel)} for 1 hour? Cost: ${price} Freebucks.`
+                );
+                if (!ok) {
+                  ctx.ui.notify("Rental cancelled.", "info");
+                  return;
+                }
+              }
+              const res = await activeClient.startSession(targetModel);
+              ctx.ui.notify(res.message, res.ok ? "info" : "error");
+            }
+          }
+        } else if (choice === "🛑 End / Release Current Session") {
+          if (activeClient) {
+            await activeClient.deleteSession();
+            ctx.ui.notify("Active session released.", "info");
           }
         } else if (choice === "Rotate to next account") {
           const rotated = pool.rotateNext(true);
@@ -1862,18 +1979,24 @@ export default async function (pi: ExtensionAPI) {
               : "Could not rotate to another account.",
             "info"
           );
-        } else if (choice === "Reset active cloud session (clear lock)") {
-          const activeClient = pool.peekActive()?.client;
-          if (activeClient) {
-            await activeClient.deleteSession();
-            ctx.ui.notify("Active cloud session cleared successfully.", "info");
-          }
-        } else if (choice && choice.startsWith("Switch to: ")) {
-          const pickedModel = choice.replace("Switch to: ", "");
+        } else if (choice === "📋 View Balance & Accounts Status") {
+          ctx.ui.notify(infoLines.join("\n"), "info");
+        } else if (choice === "+ Add Auth Token / Login (freebuff.llm.pm)") {
           ctx.ui.notify(
-            `To use this model, run:\npi --model ${pickedModel}\nor select it via /model`,
+            "Login Link: https://freebuff.llm.pm\nLog in with your account to get your token.",
             "info"
           );
+          const inputToken = (
+            await ctx.ui.input("Paste Auth Token here:", "Paste token here")
+          )?.trim();
+          if (inputToken) {
+            const savedKey = saveAuthToken(inputToken);
+            pool.addToken(inputToken);
+            ctx.ui.notify(
+              `Token saved as [${savedKey}]! Pool now has ${pool.size} account(s).`,
+              "info"
+            );
+          }
         }
       } else {
         ctx.ui.notify(infoLines.join("\n"), "info");
