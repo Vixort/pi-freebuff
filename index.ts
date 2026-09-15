@@ -915,6 +915,45 @@ class CodebuffClient {
     } catch {}
   }
 
+  async fetchSessionInfo(): Promise<SessionCache | null> {
+    try {
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${this.token}`,
+        "User-Agent": USER_AGENT,
+      };
+      if (this.currentSession?.instanceId) {
+        headers["x-freebuff-instance-id"] = this.currentSession.instanceId;
+      }
+      const res = await safeFetch(`${CODEBUFF_API_URL}/api/v1/freebuff/session`, {
+        method: "GET",
+        headers,
+      });
+      if (res.ok) {
+        const data = (await res.json().catch(() => null)) as any;
+        if (data?.status === "active" && (data.instanceId || data.instance_id)) {
+          const now = Date.now();
+          const expiresAt = data.expiresAt ? Date.parse(data.expiresAt) : now + 3600000;
+          this.currentSession = {
+            instanceId: data.instanceId || data.instance_id,
+            model: data.model || this.currentSession?.model || "deepseek/deepseek-v4-flash",
+            expiresAt,
+            status: "active",
+            freebucks: data.freebucks || undefined,
+            rateLimitsByModel: data.rateLimitsByModel || undefined,
+            rateLimit: data.rateLimit,
+            countryCode: data.countryCode || undefined,
+            countryBlockReason: data.countryBlockReason || undefined,
+          };
+          saveSessionDisk(this.token, this.currentSession);
+        } else if (data?.freebucks && this.currentSession) {
+          this.currentSession.freebucks = data.freebucks;
+          saveSessionDisk(this.token, this.currentSession);
+        }
+      }
+    } catch {}
+    return this.currentSession;
+  }
+
   getSessionCache(): SessionCache | null {
     return this.currentSession;
   }
