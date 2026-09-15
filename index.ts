@@ -596,6 +596,45 @@ interface SessionCache {
   countryBlockReason?: string;
 }
 
+function getSessionDiskPath(): string {
+  return path.join(os.homedir(), ".config", "manicode", "freebuff-session-cache.json");
+}
+
+function saveSessionDisk(token: string, session: SessionCache | null): void {
+  try {
+    const p = getSessionDiskPath();
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    let all: Record<string, any> = {};
+    if (fs.existsSync(p)) {
+      try {
+        all = JSON.parse(fs.readFileSync(p, "utf8"));
+      } catch {}
+    }
+    const key = token.slice(0, 16);
+    if (session && session.expiresAt > Date.now()) {
+      all[key] = session;
+    } else {
+      delete all[key];
+    }
+    fs.writeFileSync(p, JSON.stringify(all, null, 2), { mode: 0o600 });
+  } catch {}
+}
+
+function loadSessionDisk(token: string): SessionCache | null {
+  try {
+    const p = getSessionDiskPath();
+    if (!fs.existsSync(p)) return null;
+    const all = JSON.parse(fs.readFileSync(p, "utf8"));
+    const session = all[token.slice(0, 16)];
+    if (!session || typeof session !== "object") return null;
+    const now = Date.now();
+    if (session.expiresAt && session.expiresAt > now + 15000) {
+      return session as SessionCache;
+    }
+  } catch {}
+  return null;
+}
+
 class CodebuffClient {
   private currentSession: SessionCache | null = null;
   // Timestamp of last real traffic (ensureSession) — heartbeats back off to
@@ -603,7 +642,9 @@ class CodebuffClient {
   private lastActivityAt = 0;
   private heartbeating = false;
 
-  constructor(public readonly token: string) {}
+  constructor(public readonly token: string) {
+    this.currentSession = loadSessionDisk(this.token);
+  }
 
   /**
    * Keep-alive ping mimicking the official desktop client: it sends
@@ -634,6 +675,7 @@ class CodebuffClient {
         // Session is no longer valid server-side — drop cache so the next
         // ensureSession() creates a fresh one.
         this.currentSession = null;
+        saveSessionDisk(this.token, null);
       } else {
         const data = (await res.json().catch(() => null)) as any;
         if (data?.expiresAt) {
@@ -650,6 +692,7 @@ class CodebuffClient {
         }
         if (this.currentSession) {
           this.currentSession.countryBlockReason = data?.countryBlockReason || undefined;
+          saveSessionDisk(this.token, this.currentSession);
         }
       }
     } catch {}
@@ -673,21 +716,34 @@ class CodebuffClient {
       });
     } catch {}
     this.currentSession = null;
+    saveSessionDisk(this.token, null);
   }
 
   async ensureSession(model: string, retry = true): Promise<string> {
     const now = Date.now();
     this.lastActivityAt = now;
+
+    if (!this.currentSession) {
+      this.currentSession = loadSessionDisk(this.token);
+    }
+
+    const targetModel = MODEL_ALIASES[model] || model;
+    const currentModel = this.currentSession
+      ? MODEL_ALIASES[this.currentSession.model] || this.currentSession.model
+      : "";
+
+    // If current session is still valid for this model, reuse it directly! Zero credits spent!
     if (
       this.currentSession &&
-      this.currentSession.model === model &&
-      this.currentSession.expiresAt > now + 15000
+      currentModel === targetModel &&
+      this.currentSession.expiresAt > now + 15000 &&
+      this.currentSession.instanceId
     ) {
       return this.currentSession.instanceId;
     }
 
-    // If model changed or expired, clear previous session
-    if (this.currentSession && this.currentSession.model !== model) {
+    // Only delete previous session if it has actually expired:
+    if (this.currentSession && this.currentSession.expiresAt <= now + 15000) {
       await this.deleteSession();
     }
 
@@ -697,20 +753,32 @@ class CodebuffClient {
         Authorization: `Bearer ${this.token}`,
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
-        "x-freebuff-model": model,
+        "x-freebuff-model": targetModel,
       },
       body: "{}",
     });
 
     if (!res.ok) {
       const errText = await res.text();
+
+      // If model is locked, keep using the existing model session rather than failing!
+      if (errText.includes("model_locked")) {
+        try {
+          const errObj = JSON.parse(errText);
+          if (errObj.currentModel && this.currentSession) {
+            this.currentSession.model = errObj.currentModel;
+            saveSessionDisk(this.token, this.currentSession);
+            return this.currentSession.instanceId;
+          }
+        } catch {}
+      }
+
       // If session model mismatch, model locked, or session superseded/expired, delete session and retry once
       if (
         retry &&
         (res.status === 409 ||
           res.status === 410 ||
           res.status === 428 ||
-          errText.includes("model_locked") ||
           errText.includes("session_model_mismatch") ||
           errText.includes("session_superseded") ||
           errText.includes("session_expired"))
@@ -729,10 +797,11 @@ class CodebuffClient {
     if (status === "queued" || status === "waiting_room" || (status !== "active" && !data.instanceId && !data.instance_id)) {
       this.currentSession = {
         instanceId: "",
-        model: data.model || model,
+        model: data.model || targetModel,
         expiresAt: now + 5000,
         status,
       };
+      saveSessionDisk(this.token, this.currentSession);
       return "";
     }
 
@@ -744,7 +813,7 @@ class CodebuffClient {
     const expiresAt = data.expiresAt ? Date.parse(data.expiresAt) : now + 3600000;
     this.currentSession = {
       instanceId,
-      model: data.model || model,
+      model: data.model || targetModel,
       expiresAt,
       status: "active",
       freebucks: data.freebucks || undefined,
@@ -753,6 +822,7 @@ class CodebuffClient {
       countryCode: data.countryCode || undefined,
       countryBlockReason: data.countryBlockReason || undefined,
     };
+    saveSessionDisk(this.token, this.currentSession);
 
     return this.currentSession.instanceId;
   }
@@ -823,6 +893,16 @@ function getModelPrice(session: SessionCache | null, model: string): number | nu
 }
 
 function isNearCreditLimit(session: SessionCache | null, model: string): boolean {
+  // If session is ALREADY ACTIVE and NOT EXPIRED, zero new credits are required to keep using it!
+  const now = Date.now();
+  if (session && session.expiresAt > now + 15000) {
+    const activeModel = MODEL_ALIASES[session.model] || session.model;
+    const targetModel = MODEL_ALIASES[model] || model;
+    if (!model || activeModel === targetModel) {
+      return false; // Active paid session: keep using it until it expires!
+    }
+  }
+
   const remaining = getCreditsRemaining(session);
   if (remaining !== null) {
     const price = getModelPrice(session, model) ?? 0;
@@ -893,10 +973,6 @@ class RequestPacer {
 class TokenPool {
   private pool: TokenState[] = [];
   private activeIndex = 0;
-  // Sticky parameters: rotate after 25 requests or 1 hour
-  private switchAfterRequests = 25;
-  private switchAfterDurationMs = 60 * 60 * 1000;
-  private activeStartedAt = Date.now();
   // Last model requested, used by the credit guard to look up per-model prices
   private lastRequestedModel: string | null = null;
 
@@ -954,19 +1030,30 @@ class TokenPool {
     const now = Date.now();
     let current = this.pool[this.activeIndex];
 
-    // Check sticky rotation (time-based or request-based)
-    const shouldRotate =
-      this.pool.length > 1 &&
-      (current.requestCount >= this.switchAfterRequests ||
-        now - this.activeStartedAt > this.switchAfterDurationMs);
+    // Priority 1: Check if the current account has an ACTIVE, NON-EXPIRED session.
+    // In Freebuff's credit system, a 1-hour session is paid upfront in coins.
+    // NEVER switch accounts while an active valid session is running!
+    const currentSession = current.client.getSessionCache();
+    const hasValidActiveSession =
+      currentSession &&
+      currentSession.expiresAt > now + 15000 &&
+      !current.isBanned &&
+      current.cooldownUntil <= now;
 
-    if (shouldRotate || current.isBanned || current.cooldownUntil > now) {
+    if (hasValidActiveSession) {
+      current.requestCount++;
+      current.lastUsed = now;
+      return { state: current, client: current.client };
+    }
+
+    // Priority 2: If current account is banned or cooling down, rotate to a healthy account
+    if (current.isBanned || current.cooldownUntil > now) {
       this.rotateNext();
       current = this.pool[this.activeIndex];
     }
 
-    // Proactive Credit Guard: Check if current token's freebucks are exhausted for this model
-    const currentSession = current.client.getSessionCache();
+    // Priority 3: Only when starting a BRAND NEW session (no active session running):
+    // If current account has insufficient credits, failover to an account that can afford it
     const currentNear = currentSession
       ? isNearCreditLimit(currentSession, this.lastRequestedModel || "")
       : false;
@@ -976,13 +1063,13 @@ class TokenPool {
         const nextIdx = (this.activeIndex + i) % this.pool.length;
         const candidate = this.pool[nextIdx];
         const candSession = candidate.client.getSessionCache();
+        const candHasActive = candSession && candSession.expiresAt > now + 15000;
         const candNear = candSession
           ? isNearCreditLimit(candSession, this.lastRequestedModel || "")
           : false;
 
-        if (!candidate.isBanned && candidate.cooldownUntil <= now && !candNear) {
+        if (!candidate.isBanned && candidate.cooldownUntil <= now && (candHasActive || !candNear)) {
           this.activeIndex = nextIdx;
-          this.activeStartedAt = now;
           candidate.requestCount = 0;
           current = candidate;
           break;
@@ -1013,7 +1100,6 @@ class TokenPool {
       const candidate = this.pool[idx];
       if (manual || (!candidate.isBanned && candidate.cooldownUntil <= now)) {
         this.activeIndex = idx;
-        this.activeStartedAt = now;
         candidate.requestCount = 0;
         return true;
       }
@@ -1024,7 +1110,6 @@ class TokenPool {
   setActive(index: number): boolean {
     if (index >= 0 && index < this.pool.length) {
       this.activeIndex = index;
-      this.activeStartedAt = Date.now();
       this.pool[index].requestCount = 0;
       return true;
     }
@@ -1566,12 +1651,11 @@ export default async function (pi: ExtensionAPI) {
     (heartbeatTimer as any).unref();
   }
 
-  // Stop heartbeat, close server, and release all sessions on shutdown
-  pi.on("session_shutdown", async () => {
+  // Stop heartbeat and close server on shutdown (keep cloud sessions intact for their full hour!)
+  pi.on("session_shutdown", () => {
     try {
       clearInterval(heartbeatTimer);
       server.close();
-      await pool.cleanupAll();
     } catch {}
   });
 
@@ -1684,9 +1768,10 @@ export default async function (pi: ExtensionAPI) {
         infoLines.push(creditsLine);
       }
 
-      if (session) {
-        infoLines.push(`Active Model: ${session.model}`);
-        infoLines.push(`Instance ID: ${session.instanceId}`);
+      if (session && session.instanceId) {
+        const remainingMinutes = Math.max(0, Math.ceil((session.expiresAt - Date.now()) / 60000));
+        infoLines.push(`Active Model: ${prettyModelName(session.model)} (${remainingMinutes}m remaining)`);
+        infoLines.push(`Session ID: ${session.instanceId}`);
       }
 
       // Country restriction warning (e.g. "country_not_allowed" observed on
