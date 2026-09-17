@@ -82,6 +82,49 @@ const MODEL_DISPLAY_NAMES: Record<string, string> = {
   "stealth/ox-alpha": "Ox Alpha",
 };
 
+// Official Codebuff context windows (from freebuff-models.ts)
+const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
+  "z-ai/glm-5.3-flash": 1_000_000,
+  "z-ai/glm-5.2": 1_000_000,
+  "deepseek/deepseek-v4-flash-0731": 1_048_576,
+  "deepseek/deepseek-v4-flash": 1_048_576,
+  "deepseek/deepseek-v4-flash-max": 1_048_576,
+  "deepseek/deepseek-v4-pro": 1_048_576,
+  "deepseek/deepseek-v4-pro-max": 1_048_576,
+  "openai/gpt-5.6-luna": 1_000_000,
+  "openai/gpt-5.6-luna-es": 372_000,
+  "openai/gpt-5.6-luna-max": 1_000_000,
+  "meta/muse-spark-1.3-contributor": 1_000_000,
+  "meta/muse-spark-1.2-contributor": 1_000_000,
+  "stealth/ox-alpha": 1_000_000,
+  "ox/ox-alpha": 1_000_000,
+  "anthropic/claude-fable-5": 1_000_000,
+  "google/gemini-3.8-flash": 1_000_000,
+  "google/gemini-2.5-flash-lite": 1_000_000,
+  "google/gemini-3.5-flash-lite": 1_000_000,
+  "google/gemini-3.1-flash-lite": 1_000_000,
+  "upstage/solar-pro4": 500_000,
+  "minimax/minimax-m3": 524_288,
+  "mimo/mimo-v2.5": 262_144,
+  "crof/kimi-k3-eco": 262_144,
+};
+
+const MODEL_MAX_TOKENS: Record<string, number> = {
+  "z-ai/glm-5.3-flash": 65536,
+  "deepseek/deepseek-v4-flash-0731": 16384,
+  "deepseek/deepseek-v4-flash": 16384,
+  "deepseek/deepseek-v4-flash-max": 16384,
+  "deepseek/deepseek-v4-pro": 16384,
+  "deepseek/deepseek-v4-pro-max": 16384,
+  "openai/gpt-5.6-luna": 32768,
+  "openai/gpt-5.6-luna-es": 16384,
+  "openai/gpt-5.6-luna-max": 32768,
+  "upstage/solar-pro4": 16384,
+  "minimax/minimax-m3": 16384,
+  "mimo/mimo-v2.5": 16384,
+  "google/gemini-3.8-flash": 65536,
+};
+
 // Authoritative upstream agent -> models catalog (free-agents.ts)
 const FREE_AGENTS_URL =
   "https://raw.githubusercontent.com/CodebuffAI/codebuff/main/common/src/constants/free-agents.ts";
@@ -190,12 +233,174 @@ function getBuffyMarker(model: string): string {
 You are running on the ${model} model.
 You are the AI agent behind Freebuff, a tool where users can chat with you to code with AI for free. See freebuff.com for more information about the product.
 
-To call any tool, use the standard DSML tool format:
+To call any tool, use direct tool XML tags:
+<tool_name>
+{ "param_name": "value" }
+</tool_name>
+or the standard DSML tool format:
 <｜｜DSML｜｜tool_calls>
 <｜｜DSML｜｜invoke name="tool_name">
 <｜｜DSML｜｜parameter name="param_name" string="true">value</｜｜DSML｜｜parameter>
 </｜｜DSML｜｜invoke>
-</｜｜DSML｜｜tool_calls>`;
+</｜｜DSML｜｜tool_calls>
+
+# CRITICAL EXECUTION DIRECTIVE:
+If you need to inspect, explore, search, read files, or run commands to complete the task, you MUST invoke the tool immediately in your response turn. NEVER output conversational filler saying what you plan to do and stop your turn without calling the tool. Call the tool immediately.`;
+}
+
+function formatToolsForSystemPrompt(tools?: any[]): string {
+  if (!Array.isArray(tools) || tools.length === 0) return "";
+
+  const toolSections: string[] = [];
+  for (const t of tools) {
+    const fn = t?.function || t;
+    if (!fn || !fn.name) continue;
+    const name = String(fn.name).trim();
+    const desc = fn.description ? String(fn.description).trim() : "";
+    let paramsStr = "{}";
+    if (fn.parameters) {
+      try {
+        paramsStr = JSON.stringify(fn.parameters, null, 2);
+      } catch {}
+    }
+    toolSections.push(`### Tool: \`${name}\`\n${desc ? desc + "\n" : ""}Parameters JSON Schema:\n\`\`\`json\n${paramsStr}\n\`\`\``);
+  }
+
+  if (toolSections.length === 0) return "";
+
+  return `# Available Tools
+You have access to the following tools:
+
+${toolSections.join("\n\n")}
+
+# Tool Calling Instructions & Autonomous Agent Directives
+1. When you need to call a tool, call it IMMEDIATELY by outputting direct XML tags:
+<tool_name>
+{
+  "param_name": "param_value"
+}
+</tool_name>
+Or using standard DSML format:
+<｜｜DSML｜｜tool_calls>
+<｜｜DSML｜｜invoke name="tool_name">
+<｜｜DSML｜｜parameter name="param_name" string="true">param_value</｜｜DSML｜｜parameter>
+</｜｜DSML｜｜invoke>
+</｜｜DSML｜｜tool_calls>
+
+2. CRITICAL AUTONOMOUS DIRECTIVE (ZERO-STOP POLICY):
+- You are operating inside an autonomous non-interactive execution loop.
+- NEVER pause or stop after receiving a tool result to announce your next step!
+- When you receive a tool result (e.g. file lists, command outputs), analyze it and IMMEDIATELY call the next tool in the exact same response turn.
+- FORBIDDEN: Outputting conversational text like "ขั้นตอนที่ 2: อ่านไฟล์ src/router.ts ครับ" and stopping without calling the tool!
+- MANDATORY: If you announce an intention to inspect or read files (e.g. "ดู route ทั้งหมดจาก src/router.ts และ src/App.tsx ครับ"), you MUST include the tool call tag (<read> or <ctx_batch_execute> or <bash>) immediately in that same message.
+- Stopping without emitting a tool call breaks the agent loop and causes immediate failure.
+
+3. Autonomous Multi-Turn Example:
+User: "Analyze the project structure and routes"
+Assistant: "I will explore the codebase structure.
+<ctx_batch_execute>
+{
+  "commands": [
+    { "command": "find src -maxdepth 2", "label": "src tree" }
+  ]
+}
+</ctx_batch_execute>"
+User: "[Tool Result for ctx_batch_execute]:
+src/router.ts
+src/App.tsx"
+Assistant: "Found router.ts and App.tsx. I will read both files immediately.
+<ctx_batch_execute>
+{
+  "commands": [
+    { "command": "cat src/router.ts", "label": "router" },
+    { "command": "cat src/App.tsx", "label": "app" }
+  ]
+}
+</ctx_batch_execute>"`;
+}
+
+function normalizeMessagesForUpstream(messages: any[]): any[] {
+  if (!Array.isArray(messages)) return [];
+
+  const callIdToName: Record<string, string> = {};
+
+  return messages.map((m) => {
+    const msg = { ...m };
+
+    // 1. Assistant message with tool_calls:
+    // If assistant message has tool_calls, reconstruct XML tags in content
+    if (msg.role === "assistant") {
+      if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+        let toolXml = "";
+        for (const tc of msg.tool_calls) {
+          const fnName = tc.function?.name || tc.name;
+          const fnArgs = tc.function?.arguments || tc.arguments || "{}";
+          if (tc.id && fnName) {
+            callIdToName[tc.id] = fnName;
+          }
+          if (fnName) {
+            let formattedArgs = fnArgs;
+            if (typeof fnArgs === "object") {
+              try {
+                formattedArgs = JSON.stringify(fnArgs, null, 2);
+              } catch {}
+            }
+            toolXml += `\n<${fnName}>\n${formattedArgs}\n</${fnName}>\n`;
+          }
+        }
+        msg.content = ((msg.content || "") + toolXml).trim();
+        delete msg.tool_calls;
+      }
+    }
+
+    // 2. Tool result message:
+    // Upstream Codebuff does not accept role: "tool" without tools schema.
+    // Convert role: "tool" into role: "user" with clear tool result demarcation.
+    if (msg.role === "tool") {
+      const toolName = callIdToName[msg.tool_call_id] || "tool";
+      msg.role = "user";
+      msg.content = `[Tool Result for ${toolName}]:\n${msg.content || ""}`;
+      delete msg.tool_call_id;
+    }
+
+    return msg;
+  });
+}
+
+const KNOWN_BUILTIN_TOOLS = new Set<string>([
+  "bash",
+  "read",
+  "write",
+  "edit",
+  "ask_user_question",
+  "todo",
+  "web_search",
+  "fetch_content",
+  "smart_recall",
+  "ctx_batch_execute",
+  "ctx_execute",
+  "ctx_execute_file",
+  "ctx_search",
+]);
+
+function buildToolStartRegex(toolNames?: Set<string>): RegExp {
+  const merged = new Set<string>(KNOWN_BUILTIN_TOOLS);
+  if (toolNames) {
+    for (const name of toolNames) {
+      if (typeof name === "string" && name.trim()) {
+        merged.add(name.trim());
+      }
+    }
+  }
+
+  const escaped = Array.from(merged)
+    .map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|");
+  const toolPattern = escaped ? `|<(?:${escaped})\\b` : "";
+  return new RegExp(
+    `(?:<[|｜]+DSML[|｜]+|<toolcall\\b|<tool_call\\b|<tool_calls\\b|<invocation\\b|<invoke\\b|<action\\b|<function_calls\\b|<ctx_[a-zA-Z0-9_]+\\b${toolPattern})`,
+    "i"
+  );
 }
 
 function normalizeToolArguments(toolName: string, args: Record<string, any>): Record<string, any> {
@@ -297,12 +502,57 @@ function normalizeToolArguments(toolName: string, args: Record<string, any>): Re
     if (args.id !== undefined) args.id = parseInt(String(args.id), 10) || 0;
   }
 
+  // 6. Tool: ctx_batch_execute
+  if (toolName === "ctx_batch_execute") {
+    if (typeof args.commands === "string") {
+      try {
+        args.commands = JSON.parse(args.commands);
+      } catch {}
+    }
+    if (typeof args.queries === "string") {
+      try {
+        args.queries = JSON.parse(args.queries);
+      } catch {}
+    }
+    if (Array.isArray(args.commands)) {
+      args.commands = args.commands.map((cmd: any) => {
+        if (typeof cmd === "string") return { command: cmd };
+        if (cmd && typeof cmd === "object") {
+          return {
+            command: String(cmd.command || cmd.cmd || "").trim(),
+            ...(cmd.label ? { label: String(cmd.label).trim() } : {}),
+            ...(cmd.description ? { description: String(cmd.description).trim() } : {}),
+          };
+        }
+        return cmd;
+      });
+    }
+    if (Array.isArray(args.queries)) {
+      args.queries = args.queries.map((q: any) => String(q).trim()).filter(Boolean);
+    }
+  }
+
+  // 7. Tool: ctx_execute
+  if (toolName === "ctx_execute") {
+    args.command = String(args.command || args.cmd || "").trim();
+  }
+
+  // 8. Tool: ctx_search
+  if (toolName === "ctx_search") {
+    args.query = String(args.query || args.q || args.queries || "").trim();
+  }
+
+  // 9. Tool: ctx_execute_file
+  if (toolName === "ctx_execute_file") {
+    args.path = String(args.path || args.file || "").trim();
+  }
+
   // General numeric type coercion for tools expecting numbers
   for (const [k, v] of Object.entries(args)) {
     if (
       typeof v === "string" &&
       /^-?\d+$/.test(v.trim()) &&
-      !["path", "command", "content", "query", "header", "label"].includes(k)
+      !["path", "command", "content", "query", "header", "label", "commands", "queries"].includes(k)
     ) {
       args[k] = parseInt(v.trim(), 10);
     }
@@ -311,137 +561,277 @@ function normalizeToolArguments(toolName: string, args: Record<string, any>): Re
   return args;
 }
 
-function extractToolCallsFromText(rawText: string): {
+function parseArgsFromContent(body: string, toolName: string): Record<string, any> {
+  let cleaned = (body || "").trim();
+  if (cleaned.startsWith("```")) {
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+  }
+
+  // 1. Direct JSON (object or array)
+  if ((cleaned.startsWith("{") && cleaned.endsWith("}")) || (cleaned.startsWith("[") && cleaned.endsWith("]"))) {
+    try {
+      const parsed = JSON.parse(cleaned);
+      if (typeof parsed === "object" && parsed !== null) {
+        return normalizeToolArguments(
+          toolName,
+          Array.isArray(parsed) ? { commands: parsed } : parsed
+        );
+      }
+    } catch {}
+  }
+
+  // 2. XML parameters <parameter name="..."> or <param name="...">
+  const args: Record<string, any> = {};
+  const pRegex =
+    /<(?:[|｜]+DSML[|｜]+)?(?:parameter|param)\s+name="([^"]+)"(?:\s+[^>]*)?>([\s\S]*?)(?:<\/(?:[|｜]+DSML[|｜]+)?(?:parameter|param)>|$)/gi;
+  let p: RegExpExecArray | null;
+  let hasParam = false;
+  while ((p = pRegex.exec(body)) !== null) {
+    hasParam = true;
+    const pName = p[1].trim();
+    const pVal = p[2].trim();
+    try {
+      if (
+        (pVal.startsWith("{") && pVal.endsWith("}")) ||
+        (pVal.startsWith("[") && pVal.endsWith("]"))
+      ) {
+        args[pName] = JSON.parse(pVal);
+      } else {
+        args[pName] = pVal;
+      }
+    } catch {
+      args[pName] = pVal;
+    }
+  }
+  if (hasParam) return normalizeToolArguments(toolName, args);
+
+  // 3. Direct XML tags e.g. <commands>...</commands>, <queries>...</queries>
+  const directTags = /<([a-zA-Z0-9_]+)>([\s\S]*?)<\/\1>/gi;
+  let dt: RegExpExecArray | null;
+  let hasTags = false;
+  while ((dt = directTags.exec(body)) !== null) {
+    if (
+      !["parameter", "param", "invoke", "invocation", "toolcall", "tool_call", "action"].includes(
+        dt[1]
+      )
+    ) {
+      hasTags = true;
+      let val = dt[2].trim();
+      try {
+        if (
+          (val.startsWith("{") && val.endsWith("}")) ||
+          (val.startsWith("[") && val.endsWith("]"))
+        ) {
+          args[dt[1]] = JSON.parse(val);
+        } else {
+          args[dt[1]] = val;
+        }
+      } catch {
+        args[dt[1]] = val;
+      }
+    }
+  }
+  if (hasTags) return normalizeToolArguments(toolName, args);
+
+  // 4. String fallback for single-string tools
+  if (toolName === "bash") return normalizeToolArguments(toolName, { command: cleaned });
+  if (toolName === "read") return normalizeToolArguments(toolName, { path: cleaned });
+  if (toolName === "ctx_execute") return normalizeToolArguments(toolName, { command: cleaned });
+  if (toolName === "ctx_search") return normalizeToolArguments(toolName, { query: cleaned });
+
+  return normalizeToolArguments(toolName, {});
+}
+
+function extractToolCallsFromText(
+  rawText: string,
+  availableToolNames?: Set<string>
+): {
   cleanText: string;
   toolCalls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }>;
 } {
   const toolCalls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> = [];
+  const tools = new Set<string>(KNOWN_BUILTIN_TOOLS);
+  if (availableToolNames) {
+    for (const t of availableToolNames) tools.add(t);
+  }
 
-  // Match any block starting with <*DSML*...> or <toolcall> or <tool_call> or <invocation>
-  const blockRegex =
-    /(?:<[|｜]+DSML[|｜]+[^>]*>|<toolcall>|<tool_call>|<invocation[^>]*>)([\s\S]*?)(?:<\/[|｜]+DSML[|｜]+[^>]*>|<\/toolcall>|<\/tool_call>|<\/invocation>|$)/gi;
+  let earliestToolIdx = -1;
+  const markEarliest = (idx: number) => {
+    if (idx !== -1 && (earliestToolIdx === -1 || idx < earliestToolIdx)) {
+      earliestToolIdx = idx;
+    }
+  };
 
-  let blockMatch: RegExpExecArray | null;
-  while ((blockMatch = blockRegex.exec(rawText)) !== null) {
-    const inner = blockMatch[1].trim();
+  // 1. Check container blocks: <...DSML...> ... </...DSML...>, <toolcall>...</toolcall>, <tool_call>...</tool_call>, <tool_calls>...</tool_calls>, <function_calls>...</function_calls>
+  const containerRegex =
+    /(?:<[|｜]+DSML[|｜]+[^>]*>|<tool_calls>|<function_calls>|<toolcall>|<tool_call>)([\s\S]*?)(?:<\/[|｜]+DSML[|｜]+[^>]*>|<\/tool_calls>|<\/function_calls>|<\/toolcall>|<\/tool_call>|$)/gi;
+  let cMatch: RegExpExecArray | null;
+  while ((cMatch = containerRegex.exec(rawText)) !== null) {
+    markEarliest(cMatch.index);
+    const inner = cMatch[1].trim();
     if (!inner) continue;
 
-    // 1. Check if there is an explicit invoke / invocation tag
+    // Check if inner is direct JSON for tool_call: {"name": "...", "arguments": ...}
+    let cleanedInner = inner.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+    if (cleanedInner.startsWith("{") && cleanedInner.endsWith("}")) {
+      try {
+        const parsed = JSON.parse(cleanedInner);
+        if (parsed.name) {
+          const tName = String(parsed.name).trim();
+          let tArgs = parsed.arguments !== undefined ? parsed.arguments : (parsed.parameters || {});
+          if (typeof tArgs === "string") {
+            try {
+              tArgs = JSON.parse(tArgs);
+            } catch {}
+          }
+          toolCalls.push({
+            id: "call_" + Math.random().toString(36).substring(2, 11),
+            type: "function",
+            function: {
+              name: tName,
+              arguments: JSON.stringify(
+                normalizeToolArguments(tName, typeof tArgs === "object" && tArgs !== null ? tArgs : {})
+              ),
+            },
+          });
+          continue;
+        }
+      } catch {}
+    }
+
+    // Check for invoke/invocation/action tags inside container
     const invokeRegex =
-      /<(?:[|｜]+DSML[|｜]+)?(?:invoke|invocation)\s+name="([^"]+)"(?:\s+[^>]*)?>([\s\S]*?)(?:<\/(?:[|｜]+DSML[|｜]+)?(?:invoke|invocation)>|$)/gi;
+      /<(?:[|｜]+DSML[|｜]+)?(?:invoke|invocation|action)\s+name="([^"]+)"(?:\s+[^>]*)?>([\s\S]*?)(?:<\/(?:[|｜]+DSML[|｜]+)?(?:invoke|invocation|action)>|$)/gi;
     let invMatch: RegExpExecArray | null;
     let foundInvoke = false;
-
     while ((invMatch = invokeRegex.exec(inner)) !== null) {
       foundInvoke = true;
-      let rawToolName = invMatch[1].trim();
-      // Normalize common lowercase tool names
-      const knownTools = [
-        "bash",
-        "read",
-        "write",
-        "edit",
-        "ask_user_question",
-        "todo",
-        "web_search",
-        "fetch_content",
-        "smart_recall",
-      ];
-      const toolName = knownTools.includes(rawToolName.toLowerCase())
-        ? rawToolName.toLowerCase()
-        : rawToolName;
-
-      const body = invMatch[2];
-      const args: Record<string, any> = {};
-
-      const pRegex =
-        /<(?:[|｜]+DSML[|｜]+)?(?:parameter|param)\s+name="([^"]+)"(?:\s+[^>]*)?>([\s\S]*?)(?:<\/(?:[|｜]+DSML[|｜]+)?(?:parameter|param)>|$)/gi;
-      let p: RegExpExecArray | null;
-      while ((p = pRegex.exec(body)) !== null) {
-        const pName = p[1].trim();
-        const pVal = p[2].trim();
-        try {
-          if (
-            (pVal.startsWith("{") && pVal.endsWith("}")) ||
-            (pVal.startsWith("[") && pVal.endsWith("]"))
-          ) {
-            args[pName] = JSON.parse(pVal);
-          } else {
-            args[pName] = pVal;
-          }
-        } catch {
-          args[pName] = pVal;
-        }
-      }
-
-      const directTags = /<([a-zA-Z0-9_]+)>([\s\S]*?)<\/\1>/gi;
-      let dt: RegExpExecArray | null;
-      while ((dt = directTags.exec(body)) !== null) {
-        if (!["parameter", "param", "invoke", "invocation", "toolcall", "tool_call"].includes(dt[1])) {
-          args[dt[1]] = dt[2].trim();
-        }
-      }
-
-      const normalizedArgs = normalizeToolArguments(toolName, args);
-
+      const toolName = invMatch[1].trim();
+      const args = parseArgsFromContent(invMatch[2], toolName);
       toolCalls.push({
         id: "call_" + Math.random().toString(36).substring(2, 11),
         type: "function",
         function: {
           name: toolName,
-          arguments: JSON.stringify(normalizedArgs),
+          arguments: JSON.stringify(args),
         },
       });
     }
 
-    // 2. If no invoke tag was found, check direct parameter tags
+    // Check for direct tool tags inside container (e.g. <ctx_batch_execute>...</ctx_batch_execute>)
     if (!foundInvoke) {
-      const cmdMatch = /<command>([\s\S]*?)<\/command>/i.exec(inner);
-      if (cmdMatch) {
-        const args = normalizeToolArguments("bash", { command: cmdMatch[1].trim() });
-        toolCalls.push({
-          id: "call_" + Math.random().toString(36).substring(2, 11),
-          type: "function",
-          function: {
-            name: "bash",
-            arguments: JSON.stringify(args),
-          },
-        });
-      } else {
-        const qMatch = /<questions>([\s\S]*?)<\/questions>/i.exec(inner);
-        if (qMatch) {
-          let qVal: any = qMatch[1].trim();
-          try {
-            qVal = JSON.parse(qVal);
-          } catch {}
-          const args = normalizeToolArguments("ask_user_question", { questions: qVal });
+      const tagRegex = /<([a-zA-Z0-9_.-]+)(?:\s+[^>]*)?>([\s\S]*?)<\/\1>/gi;
+      let tr: RegExpExecArray | null;
+      let foundDirectTag = false;
+      while ((tr = tagRegex.exec(inner)) !== null) {
+        const tName = tr[1].trim();
+        if (tools.has(tName) || tName.startsWith("ctx_")) {
+          foundDirectTag = true;
+          const args = parseArgsFromContent(tr[2], tName);
           toolCalls.push({
             id: "call_" + Math.random().toString(36).substring(2, 11),
             type: "function",
             function: {
-              name: "ask_user_question",
+              name: tName,
               arguments: JSON.stringify(args),
             },
           });
+        }
+      }
+
+      // Legacy parameter fallbacks inside container
+      if (!foundDirectTag) {
+        const cmdMatch = /<command>([\s\S]*?)<\/command>/i.exec(inner);
+        if (cmdMatch) {
+          toolCalls.push({
+            id: "call_" + Math.random().toString(36).substring(2, 11),
+            type: "function",
+            function: {
+              name: "bash",
+              arguments: JSON.stringify(normalizeToolArguments("bash", { command: cmdMatch[1].trim() })),
+            },
+          });
         } else {
-          const pathMatch = /<path>([\s\S]*?)<\/path>/i.exec(inner);
-          if (pathMatch) {
-            const args = normalizeToolArguments("read", { path: pathMatch[1].trim() });
+          const qMatch = /<questions>([\s\S]*?)<\/questions>/i.exec(inner);
+          if (qMatch) {
+            let qVal: any = qMatch[1].trim();
+            try {
+              qVal = JSON.parse(qVal);
+            } catch {}
             toolCalls.push({
               id: "call_" + Math.random().toString(36).substring(2, 11),
               type: "function",
               function: {
-                name: "read",
-                arguments: JSON.stringify(args),
+                name: "ask_user_question",
+                arguments: JSON.stringify(
+                  normalizeToolArguments("ask_user_question", { questions: qVal })
+                ),
               },
             });
+          } else {
+            const pathMatch = /<path>([\s\S]*?)<\/path>/i.exec(inner);
+            if (pathMatch) {
+              toolCalls.push({
+                id: "call_" + Math.random().toString(36).substring(2, 11),
+                type: "function",
+                function: {
+                  name: "read",
+                  arguments: JSON.stringify(normalizeToolArguments("read", { path: pathMatch[1].trim() })),
+                },
+              });
+            }
           }
         }
       }
     }
   }
 
-  // Deduplicate identical consecutive tool calls if model hallucinated/repeated
+  // 2. Standalone invoke tags outside containers: <invoke name="...">...</invoke>
+  const standaloneInvokeRegex =
+    /<(?:invoke|invocation|action)\s+name="([^"]+)"(?:\s+[^>]*)?>([\s\S]*?)(?:<\/(?:invoke|invocation|action)>|$)/gi;
+  let saMatch: RegExpExecArray | null;
+  while ((saMatch = standaloneInvokeRegex.exec(rawText)) !== null) {
+    markEarliest(saMatch.index);
+    const toolName = saMatch[1].trim();
+    const args = parseArgsFromContent(saMatch[2], toolName);
+    toolCalls.push({
+      id: "call_" + Math.random().toString(36).substring(2, 11),
+      type: "function",
+      function: {
+        name: toolName,
+        arguments: JSON.stringify(args),
+      },
+    });
+  }
+
+  // 3. Direct tool tags anywhere in rawText: <ctx_batch_execute>...</ctx_batch_execute>, <bash>...</bash>, etc.
+  const directToolRegex = /<([a-zA-Z0-9_.-]+)(?:\s+[^>]*)?>([\s\S]*?)(?:<\/\1>|$)/gi;
+  let dtMatch: RegExpExecArray | null;
+  while ((dtMatch = directToolRegex.exec(rawText)) !== null) {
+    const tagName = dtMatch[1].trim();
+    if (
+      /^(?:[|｜]+DSML[|｜]+.*|toolcall|tool_call|tool_calls|function_calls|invoke|invocation|action|parameter|param|questions|question|command|commands|queries|query|path|options|option)$/i.test(
+        tagName
+      )
+    ) {
+      continue;
+    }
+
+    if (tools.has(tagName) || tagName.startsWith("ctx_")) {
+      markEarliest(dtMatch.index);
+      const args = parseArgsFromContent(dtMatch[2], tagName);
+      toolCalls.push({
+        id: "call_" + Math.random().toString(36).substring(2, 11),
+        type: "function",
+        function: {
+          name: tagName,
+          arguments: JSON.stringify(args),
+        },
+      });
+    }
+  }
+
+  // Deduplicate identical consecutive tool calls
   const uniqueToolCalls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> = [];
   for (const tc of toolCalls) {
     const isDup = uniqueToolCalls.some(
@@ -450,10 +840,7 @@ function extractToolCallsFromText(rawText: string): {
     if (!isDup) uniqueToolCalls.push(tc);
   }
 
-  // Extract clean text (text before the first tool call block)
-  const firstBlockIdx = rawText.search(/(?:<[|｜]+DSML[|｜]+|<toolcall|<tool_call|<invocation)/i);
-  const cleanText = firstBlockIdx !== -1 ? rawText.slice(0, firstBlockIdx).trim() : rawText.trim();
-
+  const cleanText = earliestToolIdx !== -1 ? rawText.slice(0, earliestToolIdx).trim() : rawText.trim();
   return { cleanText, toolCalls: uniqueToolCalls };
 }
 
@@ -461,12 +848,17 @@ class DSMLStreamTransformer {
   private inDSML = false;
   private dsmlBuffer = "";
   private carry = "";
+  private toolStartRegex: RegExp;
+  private hasNativeToolCalls = false;
 
   constructor(
     private res: http.ServerResponse,
     private id: string,
-    private model: string
-  ) {}
+    private model: string,
+    private availableToolNames?: Set<string>
+  ) {
+    this.toolStartRegex = buildToolStartRegex(this.availableToolNames);
+  }
 
   feedReasoning(reasoning: string) {
     if (!reasoning) return;
@@ -486,6 +878,19 @@ class DSMLStreamTransformer {
     this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
   }
 
+  feedNativeToolCalls(toolCalls: any[]) {
+    if (!Array.isArray(toolCalls) || toolCalls.length === 0) return;
+    this.hasNativeToolCalls = true;
+    const chunk = {
+      id: this.id,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: this.model,
+      choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: null }],
+    };
+    this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+  }
+
   feedText(text: string) {
     if (this.inDSML) {
       this.dsmlBuffer += text;
@@ -493,19 +898,24 @@ class DSMLStreamTransformer {
     }
 
     const combined = this.carry + text;
-    const dsmlMatch = /(?:<[|｜]+DSML[|｜]+|<toolcall|<tool_call|<invocation)/i.exec(combined);
+    const toolMatch = this.toolStartRegex.exec(combined);
 
-    if (dsmlMatch) {
+    if (toolMatch) {
       this.inDSML = true;
-      const pre = combined.slice(0, dsmlMatch.index);
+      const pre = combined.slice(0, toolMatch.index);
       if (pre.length > 0) {
         this.emitContentDelta(pre);
       }
-      this.dsmlBuffer = combined.slice(dsmlMatch.index);
+      this.dsmlBuffer = combined.slice(toolMatch.index);
       this.carry = "";
     } else {
       const partialIdx = combined.lastIndexOf("<");
-      if (partialIdx !== -1 && combined.length - partialIdx < 25) {
+      if (
+        partialIdx !== -1 &&
+        !combined.slice(partialIdx).includes(">") &&
+        combined.length - partialIdx < 80 &&
+        /^<[a-zA-Z0-9_|/: -]*$/.test(combined.slice(partialIdx))
+      ) {
         const emitText = combined.slice(0, partialIdx);
         this.carry = combined.slice(partialIdx);
         if (emitText.length > 0) {
@@ -539,19 +949,43 @@ class DSMLStreamTransformer {
       this.carry = "";
     }
 
-    if (this.inDSML || /(?:<[|｜]+DSML[|｜]+|<toolcall|<tool_call|<invocation)/i.test(this.dsmlBuffer)) {
-      const { toolCalls } = extractToolCallsFromText(this.dsmlBuffer);
+    if (this.hasNativeToolCalls) {
+      const endChunk = {
+        id: this.id,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model: this.model,
+        choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+      };
+      this.res.write(`data: ${JSON.stringify(endChunk)}\n\n`);
+      this.res.write("data: [DONE]\n\n");
+      return;
+    }
+
+    if (this.inDSML || this.toolStartRegex.test(this.dsmlBuffer)) {
+      const { toolCalls } = extractToolCallsFromText(this.dsmlBuffer, this.availableToolNames);
       if (toolCalls.length > 0) {
+        const formattedToolCalls = toolCalls.map((tc, idx) => ({
+          index: idx,
+          id: tc.id,
+          type: "function" as const,
+          function: tc.function,
+        }));
         const chunk = {
           id: this.id,
           object: "chat.completion.chunk",
           created: Math.floor(Date.now() / 1000),
           model: this.model,
-          choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: "tool_calls" }],
+          choices: [{ index: 0, delta: { tool_calls: formattedToolCalls }, finish_reason: "tool_calls" }],
         };
         this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
         this.res.write("data: [DONE]\n\n");
         return;
+      } else {
+        // Fallback: if tool parsing produced 0 calls, never drop the buffer silently!
+        if (this.dsmlBuffer.length > 0) {
+          this.emitContentDelta(this.dsmlBuffer);
+        }
       }
     }
 
@@ -596,6 +1030,45 @@ interface SessionCache {
   countryBlockReason?: string;
 }
 
+function getSessionDiskPath(): string {
+  return path.join(os.homedir(), ".config", "manicode", "freebuff-session-cache.json");
+}
+
+function saveSessionDisk(token: string, session: SessionCache | null): void {
+  try {
+    const p = getSessionDiskPath();
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    let all: Record<string, any> = {};
+    if (fs.existsSync(p)) {
+      try {
+        all = JSON.parse(fs.readFileSync(p, "utf8"));
+      } catch {}
+    }
+    const key = token.slice(0, 16);
+    if (session && session.expiresAt > Date.now()) {
+      all[key] = session;
+    } else {
+      delete all[key];
+    }
+    fs.writeFileSync(p, JSON.stringify(all, null, 2), { mode: 0o600 });
+  } catch {}
+}
+
+function loadSessionDisk(token: string): SessionCache | null {
+  try {
+    const p = getSessionDiskPath();
+    if (!fs.existsSync(p)) return null;
+    const all = JSON.parse(fs.readFileSync(p, "utf8"));
+    const session = all[token.slice(0, 16)];
+    if (!session || typeof session !== "object") return null;
+    const now = Date.now();
+    if (session.expiresAt && session.expiresAt > now + 15000) {
+      return session as SessionCache;
+    }
+  } catch {}
+  return null;
+}
+
 class CodebuffClient {
   private currentSession: SessionCache | null = null;
   // Timestamp of last real traffic (ensureSession) — heartbeats back off to
@@ -603,7 +1076,9 @@ class CodebuffClient {
   private lastActivityAt = 0;
   private heartbeating = false;
 
-  constructor(public readonly token: string) {}
+  constructor(public readonly token: string) {
+    this.currentSession = loadSessionDisk(this.token);
+  }
 
   /**
    * Keep-alive ping mimicking the official desktop client: it sends
@@ -634,6 +1109,7 @@ class CodebuffClient {
         // Session is no longer valid server-side — drop cache so the next
         // ensureSession() creates a fresh one.
         this.currentSession = null;
+        saveSessionDisk(this.token, null);
       } else {
         const data = (await res.json().catch(() => null)) as any;
         if (data?.expiresAt) {
@@ -650,6 +1126,7 @@ class CodebuffClient {
         }
         if (this.currentSession) {
           this.currentSession.countryBlockReason = data?.countryBlockReason || undefined;
+          saveSessionDisk(this.token, this.currentSession);
         }
       }
     } catch {}
@@ -673,22 +1150,47 @@ class CodebuffClient {
       });
     } catch {}
     this.currentSession = null;
+    saveSessionDisk(this.token, null);
   }
 
-  async ensureSession(model: string, retry = true): Promise<string> {
+  getActiveSession(targetModel?: string): SessionCache | null {
     const now = Date.now();
-    this.lastActivityAt = now;
-    if (
-      this.currentSession &&
-      this.currentSession.model === model &&
-      this.currentSession.expiresAt > now + 15000
-    ) {
-      return this.currentSession.instanceId;
+    if (!this.currentSession) {
+      this.currentSession = loadSessionDisk(this.token);
+    }
+    if (!this.currentSession || !this.currentSession.instanceId) return null;
+    if (this.currentSession.expiresAt <= now + 15000) {
+      this.currentSession = null;
+      saveSessionDisk(this.token, null);
+      return null;
+    }
+    if (targetModel) {
+      const target = MODEL_ALIASES[targetModel] || targetModel;
+      const current = MODEL_ALIASES[this.currentSession.model] || this.currentSession.model;
+      if (target !== current) return null;
+    }
+    return this.currentSession;
+  }
+
+  async startSession(model: string): Promise<{ ok: boolean; message: string; instanceId?: string }> {
+    const now = Date.now();
+    const targetModel = MODEL_ALIASES[model] || model;
+
+    // Check if session for requested model is already active
+    const active = this.getActiveSession(targetModel);
+    if (active && active.instanceId) {
+      const remainingMins = Math.ceil((active.expiresAt - now) / 60000);
+      return {
+        ok: true,
+        instanceId: active.instanceId,
+        message: `Session is already active for ${prettyModelName(active.model)} (${remainingMins}m remaining).`,
+      };
     }
 
-    // If model changed or expired, clear previous session
-    if (this.currentSession && this.currentSession.model !== model) {
+    // If an active session exists for another model, release it before renting a new model slot
+    if (this.currentSession && this.currentSession.instanceId && this.currentSession.expiresAt > now + 15000) {
       await this.deleteSession();
+      await new Promise((r) => setTimeout(r, 400));
     }
 
     const res = await safeFetch(`${CODEBUFF_API_URL}/api/v1/freebuff/session`, {
@@ -697,54 +1199,34 @@ class CodebuffClient {
         Authorization: `Bearer ${this.token}`,
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
-        "x-freebuff-model": model,
+        "x-freebuff-model": targetModel,
       },
       body: "{}",
     });
 
     if (!res.ok) {
       const errText = await res.text();
-      // If session model mismatch, model locked, or session superseded/expired, delete session and retry once
-      if (
-        retry &&
-        (res.status === 409 ||
-          res.status === 410 ||
-          res.status === 428 ||
-          errText.includes("model_locked") ||
-          errText.includes("session_model_mismatch") ||
-          errText.includes("session_superseded") ||
-          errText.includes("session_expired"))
-      ) {
-        await this.deleteSession();
-        await new Promise((r) => setTimeout(r, 400));
-        return this.ensureSession(model, false);
-      }
-      throw new Error(`Session error (${res.status}): ${errText}`);
+      let msg = errText;
+      try {
+        const errObj = JSON.parse(errText);
+        msg = errObj.message || errObj.error || errText;
+        if (errObj.freebucksShortfall) {
+          msg = `Not enough Freebucks! Costs ${errObj.freebucksShortfall.price} Freebucks/hr, but you have ${errObj.freebucksShortfall.balance} left.`;
+        }
+      } catch {}
+      return { ok: false, message: `Failed to start session (${res.status}): ${msg}` };
     }
 
     const data = (await res.json()) as any;
-
-    // Waiting room: session not active yet — return empty id, caller retries
-    const status = String(data.status || "active").toLowerCase();
-    if (status === "queued" || status === "waiting_room" || (status !== "active" && !data.instanceId && !data.instance_id)) {
-      this.currentSession = {
-        instanceId: "",
-        model: data.model || model,
-        expiresAt: now + 5000,
-        status,
-      };
-      return "";
-    }
-
     const instanceId = data.instanceId || data.instance_id;
     if (!instanceId) {
-      throw new Error(`Session response missing instanceId: ${JSON.stringify(data).slice(0, 200)}`);
+      return { ok: false, message: "Session response missing instanceId" };
     }
 
     const expiresAt = data.expiresAt ? Date.parse(data.expiresAt) : now + 3600000;
     this.currentSession = {
       instanceId,
-      model: data.model || model,
+      model: data.model || targetModel,
       expiresAt,
       status: "active",
       freebucks: data.freebucks || undefined,
@@ -753,8 +1235,34 @@ class CodebuffClient {
       countryCode: data.countryCode || undefined,
       countryBlockReason: data.countryBlockReason || undefined,
     };
+    saveSessionDisk(this.token, this.currentSession);
 
-    return this.currentSession.instanceId;
+    const mins = Math.ceil((expiresAt - now) / 60000);
+    return {
+      ok: true,
+      instanceId,
+      message: `Started 1-hour session for ${prettyModelName(this.currentSession.model)} (${mins}m remaining)!`,
+    };
+  }
+
+  async ensureSession(model: string): Promise<string> {
+    const targetModel = MODEL_ALIASES[model] || model;
+    const active = this.getActiveSession(targetModel);
+    if (active && active.instanceId) {
+      return active.instanceId;
+    }
+
+    const anyActive = this.getActiveSession();
+    if (anyActive && anyActive.instanceId) {
+      const mins = Math.ceil((anyActive.expiresAt - Date.now()) / 60000);
+      throw new Error(
+        `Active session is locked to ${prettyModelName(anyActive.model)} (${mins}m remaining). Switch to ${anyActive.model} in pi (/model) or run '/freebuff' to start a session for ${prettyModelName(targetModel)}.`
+      );
+    }
+
+    throw new Error(
+      `No active session for ${prettyModelName(targetModel)}. Run '/freebuff' (or '/freebuff start') to select your model and start a 1-hour session.`
+    );
   }
 
   async startRun(agentId: string): Promise<string> {
@@ -798,6 +1306,45 @@ class CodebuffClient {
     } catch {}
   }
 
+  async fetchSessionInfo(): Promise<SessionCache | null> {
+    try {
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${this.token}`,
+        "User-Agent": USER_AGENT,
+      };
+      if (this.currentSession?.instanceId) {
+        headers["x-freebuff-instance-id"] = this.currentSession.instanceId;
+      }
+      const res = await safeFetch(`${CODEBUFF_API_URL}/api/v1/freebuff/session`, {
+        method: "GET",
+        headers,
+      });
+      if (res.ok) {
+        const data = (await res.json().catch(() => null)) as any;
+        if (data?.status === "active" && (data.instanceId || data.instance_id)) {
+          const now = Date.now();
+          const expiresAt = data.expiresAt ? Date.parse(data.expiresAt) : now + 3600000;
+          this.currentSession = {
+            instanceId: data.instanceId || data.instance_id,
+            model: data.model || this.currentSession?.model || "deepseek/deepseek-v4-flash",
+            expiresAt,
+            status: "active",
+            freebucks: data.freebucks || undefined,
+            rateLimitsByModel: data.rateLimitsByModel || undefined,
+            rateLimit: data.rateLimit,
+            countryCode: data.countryCode || undefined,
+            countryBlockReason: data.countryBlockReason || undefined,
+          };
+          saveSessionDisk(this.token, this.currentSession);
+        } else if (data?.freebucks && this.currentSession) {
+          this.currentSession.freebucks = data.freebucks;
+          saveSessionDisk(this.token, this.currentSession);
+        }
+      }
+    } catch {}
+    return this.currentSession;
+  }
+
   getSessionCache(): SessionCache | null {
     return this.currentSession;
   }
@@ -823,6 +1370,16 @@ function getModelPrice(session: SessionCache | null, model: string): number | nu
 }
 
 function isNearCreditLimit(session: SessionCache | null, model: string): boolean {
+  // If session is ALREADY ACTIVE and NOT EXPIRED, zero new credits are required to keep using it!
+  const now = Date.now();
+  if (session && session.expiresAt > now + 15000) {
+    const activeModel = MODEL_ALIASES[session.model] || session.model;
+    const targetModel = MODEL_ALIASES[model] || model;
+    if (!model || activeModel === targetModel) {
+      return false; // Active paid session: keep using it until it expires!
+    }
+  }
+
   const remaining = getCreditsRemaining(session);
   if (remaining !== null) {
     const price = getModelPrice(session, model) ?? 0;
@@ -893,10 +1450,6 @@ class RequestPacer {
 class TokenPool {
   private pool: TokenState[] = [];
   private activeIndex = 0;
-  // Sticky parameters: rotate after 25 requests or 1 hour
-  private switchAfterRequests = 25;
-  private switchAfterDurationMs = 60 * 60 * 1000;
-  private activeStartedAt = Date.now();
   // Last model requested, used by the credit guard to look up per-model prices
   private lastRequestedModel: string | null = null;
 
@@ -954,19 +1507,30 @@ class TokenPool {
     const now = Date.now();
     let current = this.pool[this.activeIndex];
 
-    // Check sticky rotation (time-based or request-based)
-    const shouldRotate =
-      this.pool.length > 1 &&
-      (current.requestCount >= this.switchAfterRequests ||
-        now - this.activeStartedAt > this.switchAfterDurationMs);
+    // Priority 1: Check if the current account has an ACTIVE, NON-EXPIRED session.
+    // In Freebuff's credit system, a 1-hour session is paid upfront in coins.
+    // NEVER switch accounts while an active valid session is running!
+    const currentSession = current.client.getSessionCache();
+    const hasValidActiveSession =
+      currentSession &&
+      currentSession.expiresAt > now + 15000 &&
+      !current.isBanned &&
+      current.cooldownUntil <= now;
 
-    if (shouldRotate || current.isBanned || current.cooldownUntil > now) {
+    if (hasValidActiveSession) {
+      current.requestCount++;
+      current.lastUsed = now;
+      return { state: current, client: current.client };
+    }
+
+    // Priority 2: If current account is banned or cooling down, rotate to a healthy account
+    if (current.isBanned || current.cooldownUntil > now) {
       this.rotateNext();
       current = this.pool[this.activeIndex];
     }
 
-    // Proactive Credit Guard: Check if current token's freebucks are exhausted for this model
-    const currentSession = current.client.getSessionCache();
+    // Priority 3: Only when starting a BRAND NEW session (no active session running):
+    // If current account has insufficient credits, failover to an account that can afford it
     const currentNear = currentSession
       ? isNearCreditLimit(currentSession, this.lastRequestedModel || "")
       : false;
@@ -976,13 +1540,13 @@ class TokenPool {
         const nextIdx = (this.activeIndex + i) % this.pool.length;
         const candidate = this.pool[nextIdx];
         const candSession = candidate.client.getSessionCache();
+        const candHasActive = candSession && candSession.expiresAt > now + 15000;
         const candNear = candSession
           ? isNearCreditLimit(candSession, this.lastRequestedModel || "")
           : false;
 
-        if (!candidate.isBanned && candidate.cooldownUntil <= now && !candNear) {
+        if (!candidate.isBanned && candidate.cooldownUntil <= now && (candHasActive || !candNear)) {
           this.activeIndex = nextIdx;
-          this.activeStartedAt = now;
           candidate.requestCount = 0;
           current = candidate;
           break;
@@ -1013,7 +1577,6 @@ class TokenPool {
       const candidate = this.pool[idx];
       if (manual || (!candidate.isBanned && candidate.cooldownUntil <= now)) {
         this.activeIndex = idx;
-        this.activeStartedAt = now;
         candidate.requestCount = 0;
         return true;
       }
@@ -1024,7 +1587,6 @@ class TokenPool {
   setActive(index: number): boolean {
     if (index >= 0 && index < this.pool.length) {
       this.activeIndex = index;
-      this.activeStartedAt = Date.now();
       this.pool[index].requestCount = 0;
       return true;
     }
@@ -1052,6 +1614,52 @@ class TokenPool {
     await Promise.allSettled(promises);
   }
 
+  async getDetailedPoolStatus() {
+    const now = Date.now();
+    await Promise.allSettled(this.pool.map((p) => p.client.fetchSessionInfo()));
+
+    return this.pool.map((p, idx) => {
+      const session = p.client.getSessionCache();
+      const fb = session?.freebucks;
+      const balance = typeof fb?.balance === "number" ? fb.balance : null;
+      const dailyRemaining =
+        typeof fb?.daily?.remaining === "number" ? fb.daily.remaining : null;
+      const dailyLimit =
+        typeof fb?.daily?.limit === "number"
+          ? fb.daily.limit
+          : typeof fb?.daily?.granted === "number"
+          ? fb.daily.granted
+          : null;
+
+      const hasActive = Boolean(
+        session && session.instanceId && session.expiresAt > now + 15000
+      );
+      const remainingMins = hasActive
+        ? Math.max(0, Math.ceil((session!.expiresAt - now) / 60000))
+        : 0;
+
+      return {
+        index: idx,
+        name: p.name,
+        token: p.token,
+        maskedToken: p.token.slice(0, 6) + "..." + p.token.slice(-4),
+        isActive: idx === this.activeIndex,
+        isBanned: p.isBanned,
+        inCooldown: p.cooldownUntil > now,
+        cooldownMinutes:
+          p.cooldownUntil > now ? Math.ceil((p.cooldownUntil - now) / 60000) : 0,
+        requests: p.requestCount,
+        balance,
+        dailyRemaining,
+        dailyLimit,
+        activeModel: hasActive ? prettyModelName(session!.model) : null,
+        remainingMins,
+        countryCode: session?.countryCode,
+        countryBlockReason: session?.countryBlockReason,
+      };
+    });
+  }
+
   getPoolStatus() {
     const now = Date.now();
     return this.pool.map((p, idx) => ({
@@ -1069,6 +1677,29 @@ class TokenPool {
 }
 
 // ---------- Model catalog helpers ----------
+
+function matchModelShortcut(query: string, available: string[]): string | null {
+  const q = query.toLowerCase().trim();
+  const directAliases: Record<string, string> = {
+    glm: "z-ai/glm-5.3-flash",
+    "glm-5.3": "z-ai/glm-5.3-flash",
+    flash: "deepseek/deepseek-v4-flash-0731",
+    "0731": "deepseek/deepseek-v4-flash-0731",
+    deepseek: "deepseek/deepseek-v4-flash-0731",
+    mimo: "mimo/mimo-v2.5",
+    solar: "upstage/solar-pro4",
+    kimi: "crof/kimi-k3-eco",
+    luna: "openai/gpt-5.6-luna",
+    muse: "meta/muse-spark-1.3-contributor",
+    minimax: "minimax/minimax-m3",
+  };
+  if (directAliases[q]) return directAliases[q];
+  const exact = available.find((m) => m.toLowerCase() === q);
+  if (exact) return exact;
+  const partial = available.find((m) => m.toLowerCase().includes(q));
+  if (partial) return partial;
+  return null;
+}
 
 function prettyModelName(id: string): string {
   if (MODEL_DISPLAY_NAMES[id]) return MODEL_DISPLAY_NAMES[id];
@@ -1115,9 +1746,20 @@ async function fetchUpstreamCatalog(): Promise<Record<string, string[]> | null> 
 }
 
 function toModelConfig(id: string) {
+  const baseId = MODEL_ALIASES[id] || id;
   const isReasoningModel =
     id.includes("deepseek") || id.includes("glm-5.3") || id.includes("gpt-5.6");
   const displayName = `${prettyModelName(id)} (Freebuff)`;
+
+  const contextWindow =
+    MODEL_CONTEXT_WINDOWS[id] ||
+    MODEL_CONTEXT_WINDOWS[baseId] ||
+    131072;
+
+  const maxTokens =
+    MODEL_MAX_TOKENS[id] ||
+    MODEL_MAX_TOKENS[baseId] ||
+    8192;
 
   return {
     id,
@@ -1133,8 +1775,8 @@ function toModelConfig(id: string) {
       : undefined,
     input: ["text" as const, "image" as const],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 128000,
-    maxTokens: 8192,
+    contextWindow,
+    maxTokens,
     compat: {
       supportsDeveloperRole: false,
       supportsReasoningEffort: isReasoningModel,
@@ -1159,18 +1801,16 @@ export default async function (pi: ExtensionAPI) {
   const pacer = new RequestPacer();
   const primaryEntry = pool.getActive();
 
-  // Discover available models from primary session or use defaults
+  // Discover available models and current balance (read-only GET — never auto-starts session)
   let availableModels = DEFAULT_MODELS;
   if (primaryEntry) {
     try {
       const sRes = await safeFetch(`${CODEBUFF_API_URL}/api/v1/freebuff/session`, {
-        method: "POST",
+        method: "GET",
         headers: {
           Authorization: `Bearer ${primaryEntry.state.token}`,
-          "Content-Type": "application/json",
           "User-Agent": USER_AGENT,
         },
-        body: "{}",
       });
       if (sRes.ok) {
         const sData = (await sRes.json()) as any;
@@ -1250,18 +1890,34 @@ export default async function (pi: ExtensionAPI) {
             console.error("Payload keys:", Object.keys(payload));
             if (payload.tools) console.error("Tools count:", payload.tools.length);
           }
+
+          // Capture all available tool names from client before removing tools
+          const availableToolNames = new Set<string>(KNOWN_BUILTIN_TOOLS);
+          if (Array.isArray(payload.tools)) {
+            for (const t of payload.tools) {
+              const name = t?.function?.name || t?.name;
+              if (typeof name === "string" && name.trim()) {
+                availableToolNames.add(name.trim());
+              }
+            }
+          }
+
           const requestedModel = payload.model || "deepseek/deepseek-v4-flash-0731";
           const upstreamModel = MODEL_ALIASES[requestedModel] || requestedModel;
           const agentId = AGENT_MAP[requestedModel] || AGENT_MAP[upstreamModel] || "base3-free-deepseek-flash";
 
-          // Inject Buffy system marker
+          // Inject Buffy system marker and tool documentation
           const marker = getBuffyMarker(upstreamModel);
-          const messages = Array.isArray(payload.messages) ? payload.messages : [];
+          const toolsPrompt = formatToolsForSystemPrompt(payload.tools);
+          const fullMarker = toolsPrompt ? `${marker}\n\n${toolsPrompt}` : marker;
+          let messages = Array.isArray(payload.messages) ? payload.messages : [];
           if (messages.length > 0 && messages[0].role === "system") {
-            messages[0].content = `${marker}\n\n${messages[0].content}`;
+            messages[0].content = `${fullMarker}\n\n${messages[0].content}`;
           } else {
-            messages.unshift({ role: "system", content: marker });
+            messages.unshift({ role: "system", content: fullMarker });
           }
+          // Normalize messages for upstream: reconstruct tool calls into assistant XML and convert role: "tool" to user results
+          messages = normalizeMessagesForUpstream(messages);
           payload.messages = messages;
           payload.model = upstreamModel; // Send upstream-compatible model ID
 
@@ -1423,11 +2079,12 @@ export default async function (pi: ExtensionAPI) {
           if (!isStream) {
             const data = (await upstreamRes.json()) as any;
             const choice = data.choices?.[0];
-            if (
-              choice?.message?.content &&
-              /(?:<[|｜]+DSML[|｜]+|<toolcall|<tool_call|<invocation)/i.test(choice.message.content)
-            ) {
-              const { cleanText, toolCalls } = extractToolCallsFromText(choice.message.content);
+            const toolRegex = buildToolStartRegex(availableToolNames);
+            if (choice?.message?.content && toolRegex.test(choice.message.content)) {
+              const { cleanText, toolCalls } = extractToolCallsFromText(
+                choice.message.content,
+                availableToolNames
+              );
               if (toolCalls.length > 0) {
                 choice.message.content = cleanText || null;
                 choice.message.tool_calls = toolCalls;
@@ -1479,7 +2136,8 @@ export default async function (pi: ExtensionAPI) {
           const transformer = new DSMLStreamTransformer(
             res,
             "chatcmpl-" + Math.random().toString(36).substring(2, 12),
-            requestedModel
+            requestedModel,
+            availableToolNames
           );
 
           const decoder = new TextDecoder();
@@ -1508,6 +2166,9 @@ export default async function (pi: ExtensionAPI) {
                     }
                     if (delta?.content) {
                       transformer.feedText(delta.content);
+                    }
+                    if (delta?.tool_calls) {
+                      transformer.feedNativeToolCalls(delta.tool_calls);
                     }
                   } catch {}
                 }
@@ -1566,12 +2227,11 @@ export default async function (pi: ExtensionAPI) {
     (heartbeatTimer as any).unref();
   }
 
-  // Stop heartbeat, close server, and release all sessions on shutdown
-  pi.on("session_shutdown", async () => {
+  // Stop heartbeat and close server on shutdown (keep cloud sessions intact for their full hour!)
+  pi.on("session_shutdown", () => {
     try {
       clearInterval(heartbeatTimer);
       server.close();
-      await pool.cleanupAll();
     } catch {}
   });
 
@@ -1586,13 +2246,86 @@ export default async function (pi: ExtensionAPI) {
 
   // Register /freebuff command for UI
   pi.registerCommand("freebuff", {
-    description: "Manage Freebuff tokens, rotation, models, and status",
+    description: "Manage Freebuff sessions, model rental, tokens, and status",
     handler: async (args, ctx) => {
       const rawArgs = (args || "").trim();
       const parts = rawArgs.split(/\s+/).filter(Boolean);
       const sub = parts[0]?.toLowerCase();
+      const activeClient = pool.peekActive()?.client;
 
-      // 1. Subcommand: /freebuff add <token>
+      // 1. Subcommand: /freebuff start [model]
+      if (sub === "start") {
+        if (!activeClient) {
+          ctx.ui.notify(
+            "No active account token found. Run /freebuff login first.",
+            "warning"
+          );
+          return;
+        }
+
+        let modelArg = parts.slice(1).join(" ").trim();
+        let targetModel = "";
+
+        if (modelArg) {
+          const matched = matchModelShortcut(modelArg, availableModels);
+          if (!matched) {
+            ctx.ui.notify(
+              `Unknown model "${modelArg}". Available: ${availableModels.join(", ")}`,
+              "warning"
+            );
+            return;
+          }
+          targetModel = matched;
+        } else if (ctx.hasUI) {
+          await activeClient.fetchSessionInfo();
+          const session = activeClient.getSessionCache();
+          const balance = session?.freebucks?.balance ?? "?";
+
+          const options = availableModels.map((m) => {
+            const price = getModelPrice(session ?? null, m);
+            const priceText = price !== null ? `${price} Freebucks/hr` : "Standard";
+            return `${prettyModelName(m)} (${priceText}) -> ${m}`;
+          });
+
+          const choice = await ctx.ui.select(
+            `Select Model to Rent for 1 Hour (Balance: ${balance}):`,
+            [...options, "Cancel"]
+          );
+          if (!choice || choice === "Cancel") return;
+          targetModel = choice.split(" -> ")[1]?.trim() || "";
+        }
+
+        if (!targetModel) return;
+
+        const price = getModelPrice(activeClient.getSessionCache(), targetModel);
+        if (ctx.hasUI && price !== null) {
+          const ok = await ctx.ui.confirm(
+            "Confirm 1-Hour Rental",
+            `Rent ${prettyModelName(targetModel)} for 1 hour? Cost: ${price} Freebucks.`
+          );
+          if (!ok) {
+            ctx.ui.notify("Rental cancelled.", "info");
+            return;
+          }
+        }
+
+        const res = await activeClient.startSession(targetModel);
+        ctx.ui.notify(res.message, res.ok ? "info" : "error");
+        return;
+      }
+
+      // 2. Subcommand: /freebuff stop / end / reset
+      if (sub === "stop" || sub === "end" || sub === "reset") {
+        if (activeClient) {
+          await activeClient.deleteSession();
+          ctx.ui.notify("Active cloud session released successfully.", "info");
+        } else {
+          ctx.ui.notify("No active account found.", "warning");
+        }
+        return;
+      }
+
+      // 3. Subcommand: /freebuff add <token>
       if (sub === "add") {
         let tokenToAdd = parts.slice(1).join(" ").trim();
         if (!tokenToAdd && ctx.hasUI) {
@@ -1608,7 +2341,7 @@ export default async function (pi: ExtensionAPI) {
           return;
         }
         const savedKey = saveAuthToken(tokenToAdd);
-        const added = pool.addToken(tokenToAdd);
+        pool.addToken(tokenToAdd);
         ctx.ui.notify(
           `Token saved as [${savedKey}] and added to pool (${pool.size} account(s) ready).`,
           "info"
@@ -1616,7 +2349,7 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      // 2. Subcommand: /freebuff login
+      // 4. Subcommand: /freebuff login
       if (sub === "login") {
         if (ctx.hasUI) {
           ctx.ui.notify(
@@ -1646,7 +2379,7 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      // 3. Subcommand: /freebuff rotate
+      // 5. Subcommand: /freebuff rotate
       if (sub === "rotate") {
         const rotated = pool.rotateNext(true);
         const newActive = pool.getPoolStatus().find((p) => p.isActive);
@@ -1659,65 +2392,147 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      // 4. Subcommand: /freebuff list or status
-      const poolStatus = pool.getPoolStatus();
-      const activeAccount = poolStatus.find((p) => p.isActive);
-      const activeClient = pool.peekActive()?.client;
+      // 6. Subcommand: /freebuff help
+      if (sub === "help") {
+        const helpText = [
+          "Freebuff Commands Guide:",
+          "/freebuff             - Open interactive dashboard & session manager",
+          "/freebuff start       - Open model picker to rent a 1-hour session",
+          "/freebuff start <mdl> - Rent 1-hour session (e.g. glm, 0731, solar)",
+          "/freebuff stop        - Release current cloud session",
+          "/freebuff status      - View accounts, Freebucks balance & countdown",
+          "/freebuff login       - Open login link & prompt to paste token",
+          "/freebuff add <token> - Add an auth token to the account pool",
+          "/freebuff rotate      - Switch to next standby account",
+          "/model                - Open pi native model selector",
+        ].join("\n");
+        ctx.ui.notify(helpText, "info");
+        return;
+      }
+
+      // 7. Default: account dashboard + interactive menu
+      const accounts = await pool.getDetailedPoolStatus();
+      const activeAcc = accounts.find((a) => a.isActive);
+      const hasActive = Boolean(activeAcc?.activeModel);
+      const remainingMins = activeAcc?.remainingMins ?? 0;
       const session = activeClient?.getSessionCache();
 
-      const accountLines = poolStatus.map(
-        (p) =>
-          `[${p.isActive ? "ACTIVE" : "STANDBY"}] ${p.name} - ${p.requests} reqs${
-            p.isBanned ? " (BANNED)" : p.inCooldown ? ` (COOLDOWN ${p.cooldownMinutes}m)` : ""
-          }`
-      );
+      const divider = "─".repeat(50);
+      const accountCards = accounts
+        .map((a) => {
+          const tag = a.isBanned
+            ? "[BANNED  ]"
+            : a.inCooldown
+            ? `[COOLDOWN ${a.cooldownMinutes}m]`
+            : a.isActive
+            ? "[ACTIVE  ]"
+            : "[STANDBY ]";
+          const coins = a.balance !== null ? `${a.balance}` : "?";
+          const daily =
+            a.dailyRemaining !== null && a.dailyLimit !== null
+              ? `Daily: ${a.dailyRemaining}/${a.dailyLimit}`
+              : "Daily: ?";
+          const sessionLine = a.activeModel
+            ? `${a.activeModel} (${a.remainingMins}m left)`
+            : "None (Idle)";
+          const lines = [
+            `${tag}  ${a.name}  (${a.maskedToken})`,
+            `           Freebucks : ${coins} coins  |  ${daily}`,
+            `           Session   : ${sessionLine}`,
+            `           Traffic   : ${a.requests} request(s) served`,
+          ];
+          if (a.countryBlockReason) {
+            lines.push(`           ! ${a.countryCode ?? ""}:  ${a.countryBlockReason}`);
+          }
+          return lines.join("\n");
+        })
+        .join("\n\n");
 
-      const infoLines = [
-        `Provider: Freebuff (Embedded Native - No Docker)`,
-        `Token Pool: ${pool.size} account(s) loaded`,
-        ...accountLines,
-        `Active Account: ${activeAccount?.name || "None"}`,
-      ];
+      const headerLine = hasActive
+        ? `  Active: ${prettyModelName(activeAcc!.activeModel!)}  |  ${remainingMins}m remaining`
+        : "  No Active Session  |  Select an action below:";
 
-      const creditsLine = formatCreditsLine(session ?? null);
-      if (creditsLine) {
-        infoLines.push(creditsLine);
-      }
-
-      if (session) {
-        infoLines.push(`Active Model: ${session.model}`);
-        infoLines.push(`Instance ID: ${session.instanceId}`);
-      }
-
-      // Country restriction warning (e.g. "country_not_allowed" observed on
-      // limited-tier accounts — upstream may restrict or flag these regions)
-      if (session?.countryBlockReason) {
-        infoLines.push(
-          `⚠ Country: ${session.countryCode || "unknown"} (${session.countryBlockReason}) — this account region may be restricted upstream`
-        );
-      }
+      const dashboardTitle = [
+        divider,
+        "  FREEBUFF ACCOUNT DASHBOARD",
+        divider,
+        accountCards,
+        divider,
+        headerLine,
+      ].join("\n");
 
       if (ctx.hasUI) {
-        const menuOptions: string[] = [
-          "+ Add Auth Token / Login (freebuff.llm.pm)",
-        ];
-        if (pool.size > 1) {
-          menuOptions.push("Rotate to next account");
+        const menuOptions: string[] = [];
+        if (hasActive) {
+          menuOptions.push(
+            `[Active] ${prettyModelName(activeAcc!.activeModel!)} (${remainingMins}m left)`
+          );
+          menuOptions.push("[Switch] Rent Different Model (New 1-Hour Session)");
+          menuOptions.push("[End] Release Active Session");
+        } else {
+          menuOptions.push("[Start] Rent 1-Hour Session (Select Model)");
         }
-        menuOptions.push(...availableModels.map((m) => `Switch to: freebuff/${m}`));
+        if (accounts.length > 1) {
+          menuOptions.push("[Rotate] Switch to Next Standby Account");
+        }
+        menuOptions.push("[Status] Show Dashboard in Notification");
+        menuOptions.push("[Token] Add Auth Token / Login");
         menuOptions.push("Close");
 
-        const choice = await ctx.ui.select("Freebuff Status & Options:", menuOptions);
-        if (choice === "+ Add Auth Token / Login (freebuff.llm.pm)") {
+        const choice = await ctx.ui.select(dashboardTitle, menuOptions);
+
+        if (choice && (choice.startsWith("[Start]") || choice.startsWith("[Switch]"))) {
+          const balance = session?.freebucks?.balance ?? "?";
+          const modelOptions = availableModels.map((m) => {
+            const price = getModelPrice(session ?? null, m);
+            const priceText = price !== null ? `${price} Freebucks/hr` : "Standard";
+            return `${prettyModelName(m)} (${priceText}) -> ${m}`;
+          });
+          const picked = await ctx.ui.select(
+            `Select Model to Rent for 1 Hour (Balance: ${balance}):`,
+            [...modelOptions, "Cancel"]
+          );
+          if (picked && picked !== "Cancel") {
+            const targetModel = picked.split(" -> ")[1]?.trim();
+            if (targetModel && activeClient) {
+              const price = getModelPrice(session ?? null, targetModel);
+              if (price !== null) {
+                const ok = await ctx.ui.confirm(
+                  "Confirm Rental",
+                  `Rent ${prettyModelName(targetModel)} for 1 hour? Cost: ${price} Freebucks.`
+                );
+                if (!ok) {
+                  ctx.ui.notify("Rental cancelled.", "info");
+                  return;
+                }
+              }
+              const res = await activeClient.startSession(targetModel);
+              ctx.ui.notify(res.message, res.ok ? "info" : "error");
+            }
+          }
+        } else if (choice && choice.startsWith("[End]")) {
+          if (activeClient) {
+            await activeClient.deleteSession();
+            ctx.ui.notify("Active session released successfully.", "info");
+          }
+        } else if (choice && choice.startsWith("[Rotate]")) {
+          const rotated = pool.rotateNext(true);
+          const newActive = pool.getPoolStatus().find((p) => p.isActive);
+          ctx.ui.notify(
+            rotated
+              ? `Switched active account to: ${newActive?.name}`
+              : "Could not rotate to another account.",
+            "info"
+          );
+        } else if (choice && choice.startsWith("[Status]")) {
+          ctx.ui.notify(dashboardTitle, "info");
+        } else if (choice && choice.startsWith("[Token]")) {
           ctx.ui.notify(
             "Login Link: https://freebuff.llm.pm\nLog in with your account to get your token.",
             "info"
           );
           const inputToken = (
-            await ctx.ui.input(
-              "Paste Auth Token here:",
-              "Paste token here"
-            )
+            await ctx.ui.input("Paste Auth Token here:", "Paste token here")
           )?.trim();
           if (inputToken) {
             const savedKey = saveAuthToken(inputToken);
@@ -1727,24 +2542,9 @@ export default async function (pi: ExtensionAPI) {
               "info"
             );
           }
-        } else if (choice === "Rotate to next account") {
-          const rotated = pool.rotateNext(true);
-          const newActive = pool.getPoolStatus().find((p) => p.isActive);
-          ctx.ui.notify(
-            rotated
-              ? `Switched active account to: ${newActive?.name}`
-              : "Could not rotate to another account.",
-            "info"
-          );
-        } else if (choice && choice.startsWith("Switch to: ")) {
-          const pickedModel = choice.replace("Switch to: ", "");
-          ctx.ui.notify(
-            `To use this model, run:\npi --model ${pickedModel}\nor select it via /model`,
-            "info"
-          );
         }
       } else {
-        ctx.ui.notify(infoLines.join("\n"), "info");
+        ctx.ui.notify(dashboardTitle, "info");
       }
     },
   });

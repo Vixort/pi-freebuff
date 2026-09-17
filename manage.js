@@ -204,6 +204,13 @@ async function actionClearStaleSessions() {
       console.log(`   [${item.key}] Error: ${err.message}`);
     }
   }
+  const cacheFile = path.join(os.homedir(), ".config", "manicode", "freebuff-session-cache.json");
+  if (fs.existsSync(cacheFile)) {
+    try {
+      fs.unlinkSync(cacheFile);
+      console.log(`   Local session cache cleared.`);
+    } catch {}
+  }
   console.log(`${c.green}>> Done clearing stale sessions!${c.reset}`);
 }
 
