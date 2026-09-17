@@ -10,7 +10,7 @@
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows%20%7C%20macOS-informational)](#cross-platform-manager)
 [![Runtime](https://img.shields.io/badge/Node.js-%3E%3D18.0.0-brightgreen)](#)
 [![pi CLI](https://img.shields.io/badge/pi%20CLI-Compatible-purple)](https://github.com/earendil-works/pi-coding-agent)
-[![Release](https://img.shields.io/badge/Release-v1.1.0-success)](#)
+[![Release](https://img.shields.io/badge/Release-v1.2.0-success)](#)
 
 [Features](#-key-features) • [Architecture](#-architecture--logic) • [Quick Start](#-quick-start) • [Coin System](#-freebucks-coin-system) • [Anti-Ban Shield](#-5-layer-anti-ban--stealth-shield) • [Configuration](#-configuration)
 

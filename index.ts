@@ -233,12 +233,174 @@ function getBuffyMarker(model: string): string {
 You are running on the ${model} model.
 You are the AI agent behind Freebuff, a tool where users can chat with you to code with AI for free. See freebuff.com for more information about the product.
 
-To call any tool, use the standard DSML tool format:
+To call any tool, use direct tool XML tags:
+<tool_name>
+{ "param_name": "value" }
+</tool_name>
+or the standard DSML tool format:
 <｜｜DSML｜｜tool_calls>
 <｜｜DSML｜｜invoke name="tool_name">
 <｜｜DSML｜｜parameter name="param_name" string="true">value</｜｜DSML｜｜parameter>
 </｜｜DSML｜｜invoke>
-</｜｜DSML｜｜tool_calls>`;
+</｜｜DSML｜｜tool_calls>
+
+# CRITICAL EXECUTION DIRECTIVE:
+If you need to inspect, explore, search, read files, or run commands to complete the task, you MUST invoke the tool immediately in your response turn. NEVER output conversational filler saying what you plan to do and stop your turn without calling the tool. Call the tool immediately.`;
+}
+
+function formatToolsForSystemPrompt(tools?: any[]): string {
+  if (!Array.isArray(tools) || tools.length === 0) return "";
+
+  const toolSections: string[] = [];
+  for (const t of tools) {
+    const fn = t?.function || t;
+    if (!fn || !fn.name) continue;
+    const name = String(fn.name).trim();
+    const desc = fn.description ? String(fn.description).trim() : "";
+    let paramsStr = "{}";
+    if (fn.parameters) {
+      try {
+        paramsStr = JSON.stringify(fn.parameters, null, 2);
+      } catch {}
+    }
+    toolSections.push(`### Tool: \`${name}\`\n${desc ? desc + "\n" : ""}Parameters JSON Schema:\n\`\`\`json\n${paramsStr}\n\`\`\``);
+  }
+
+  if (toolSections.length === 0) return "";
+
+  return `# Available Tools
+You have access to the following tools:
+
+${toolSections.join("\n\n")}
+
+# Tool Calling Instructions & Autonomous Agent Directives
+1. When you need to call a tool, call it IMMEDIATELY by outputting direct XML tags:
+<tool_name>
+{
+  "param_name": "param_value"
+}
+</tool_name>
+Or using standard DSML format:
+<｜｜DSML｜｜tool_calls>
+<｜｜DSML｜｜invoke name="tool_name">
+<｜｜DSML｜｜parameter name="param_name" string="true">param_value</｜｜DSML｜｜parameter>
+</｜｜DSML｜｜invoke>
+</｜｜DSML｜｜tool_calls>
+
+2. CRITICAL AUTONOMOUS DIRECTIVE (ZERO-STOP POLICY):
+- You are operating inside an autonomous non-interactive execution loop.
+- NEVER pause or stop after receiving a tool result to announce your next step!
+- When you receive a tool result (e.g. file lists, command outputs), analyze it and IMMEDIATELY call the next tool in the exact same response turn.
+- FORBIDDEN: Outputting conversational text like "ขั้นตอนที่ 2: อ่านไฟล์ src/router.ts ครับ" and stopping without calling the tool!
+- MANDATORY: If you announce an intention to inspect or read files (e.g. "ดู route ทั้งหมดจาก src/router.ts และ src/App.tsx ครับ"), you MUST include the tool call tag (<read> or <ctx_batch_execute> or <bash>) immediately in that same message.
+- Stopping without emitting a tool call breaks the agent loop and causes immediate failure.
+
+3. Autonomous Multi-Turn Example:
+User: "Analyze the project structure and routes"
+Assistant: "I will explore the codebase structure.
+<ctx_batch_execute>
+{
+  "commands": [
+    { "command": "find src -maxdepth 2", "label": "src tree" }
+  ]
+}
+</ctx_batch_execute>"
+User: "[Tool Result for ctx_batch_execute]:
+src/router.ts
+src/App.tsx"
+Assistant: "Found router.ts and App.tsx. I will read both files immediately.
+<ctx_batch_execute>
+{
+  "commands": [
+    { "command": "cat src/router.ts", "label": "router" },
+    { "command": "cat src/App.tsx", "label": "app" }
+  ]
+}
+</ctx_batch_execute>"`;
+}
+
+function normalizeMessagesForUpstream(messages: any[]): any[] {
+  if (!Array.isArray(messages)) return [];
+
+  const callIdToName: Record<string, string> = {};
+
+  return messages.map((m) => {
+    const msg = { ...m };
+
+    // 1. Assistant message with tool_calls:
+    // If assistant message has tool_calls, reconstruct XML tags in content
+    if (msg.role === "assistant") {
+      if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+        let toolXml = "";
+        for (const tc of msg.tool_calls) {
+          const fnName = tc.function?.name || tc.name;
+          const fnArgs = tc.function?.arguments || tc.arguments || "{}";
+          if (tc.id && fnName) {
+            callIdToName[tc.id] = fnName;
+          }
+          if (fnName) {
+            let formattedArgs = fnArgs;
+            if (typeof fnArgs === "object") {
+              try {
+                formattedArgs = JSON.stringify(fnArgs, null, 2);
+              } catch {}
+            }
+            toolXml += `\n<${fnName}>\n${formattedArgs}\n</${fnName}>\n`;
+          }
+        }
+        msg.content = ((msg.content || "") + toolXml).trim();
+        delete msg.tool_calls;
+      }
+    }
+
+    // 2. Tool result message:
+    // Upstream Codebuff does not accept role: "tool" without tools schema.
+    // Convert role: "tool" into role: "user" with clear tool result demarcation.
+    if (msg.role === "tool") {
+      const toolName = callIdToName[msg.tool_call_id] || "tool";
+      msg.role = "user";
+      msg.content = `[Tool Result for ${toolName}]:\n${msg.content || ""}`;
+      delete msg.tool_call_id;
+    }
+
+    return msg;
+  });
+}
+
+const KNOWN_BUILTIN_TOOLS = new Set<string>([
+  "bash",
+  "read",
+  "write",
+  "edit",
+  "ask_user_question",
+  "todo",
+  "web_search",
+  "fetch_content",
+  "smart_recall",
+  "ctx_batch_execute",
+  "ctx_execute",
+  "ctx_execute_file",
+  "ctx_search",
+]);
+
+function buildToolStartRegex(toolNames?: Set<string>): RegExp {
+  const merged = new Set<string>(KNOWN_BUILTIN_TOOLS);
+  if (toolNames) {
+    for (const name of toolNames) {
+      if (typeof name === "string" && name.trim()) {
+        merged.add(name.trim());
+      }
+    }
+  }
+
+  const escaped = Array.from(merged)
+    .map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|");
+  const toolPattern = escaped ? `|<(?:${escaped})\\b` : "";
+  return new RegExp(
+    `(?:<[|｜]+DSML[|｜]+|<toolcall\\b|<tool_call\\b|<tool_calls\\b|<invocation\\b|<invoke\\b|<action\\b|<function_calls\\b|<ctx_[a-zA-Z0-9_]+\\b${toolPattern})`,
+    "i"
+  );
 }
 
 function normalizeToolArguments(toolName: string, args: Record<string, any>): Record<string, any> {
@@ -340,12 +502,57 @@ function normalizeToolArguments(toolName: string, args: Record<string, any>): Re
     if (args.id !== undefined) args.id = parseInt(String(args.id), 10) || 0;
   }
 
+  // 6. Tool: ctx_batch_execute
+  if (toolName === "ctx_batch_execute") {
+    if (typeof args.commands === "string") {
+      try {
+        args.commands = JSON.parse(args.commands);
+      } catch {}
+    }
+    if (typeof args.queries === "string") {
+      try {
+        args.queries = JSON.parse(args.queries);
+      } catch {}
+    }
+    if (Array.isArray(args.commands)) {
+      args.commands = args.commands.map((cmd: any) => {
+        if (typeof cmd === "string") return { command: cmd };
+        if (cmd && typeof cmd === "object") {
+          return {
+            command: String(cmd.command || cmd.cmd || "").trim(),
+            ...(cmd.label ? { label: String(cmd.label).trim() } : {}),
+            ...(cmd.description ? { description: String(cmd.description).trim() } : {}),
+          };
+        }
+        return cmd;
+      });
+    }
+    if (Array.isArray(args.queries)) {
+      args.queries = args.queries.map((q: any) => String(q).trim()).filter(Boolean);
+    }
+  }
+
+  // 7. Tool: ctx_execute
+  if (toolName === "ctx_execute") {
+    args.command = String(args.command || args.cmd || "").trim();
+  }
+
+  // 8. Tool: ctx_search
+  if (toolName === "ctx_search") {
+    args.query = String(args.query || args.q || args.queries || "").trim();
+  }
+
+  // 9. Tool: ctx_execute_file
+  if (toolName === "ctx_execute_file") {
+    args.path = String(args.path || args.file || "").trim();
+  }
+
   // General numeric type coercion for tools expecting numbers
   for (const [k, v] of Object.entries(args)) {
     if (
       typeof v === "string" &&
       /^-?\d+$/.test(v.trim()) &&
-      !["path", "command", "content", "query", "header", "label"].includes(k)
+      !["path", "command", "content", "query", "header", "label", "commands", "queries"].includes(k)
     ) {
       args[k] = parseInt(v.trim(), 10);
     }
@@ -354,137 +561,277 @@ function normalizeToolArguments(toolName: string, args: Record<string, any>): Re
   return args;
 }
 
-function extractToolCallsFromText(rawText: string): {
+function parseArgsFromContent(body: string, toolName: string): Record<string, any> {
+  let cleaned = (body || "").trim();
+  if (cleaned.startsWith("```")) {
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+  }
+
+  // 1. Direct JSON (object or array)
+  if ((cleaned.startsWith("{") && cleaned.endsWith("}")) || (cleaned.startsWith("[") && cleaned.endsWith("]"))) {
+    try {
+      const parsed = JSON.parse(cleaned);
+      if (typeof parsed === "object" && parsed !== null) {
+        return normalizeToolArguments(
+          toolName,
+          Array.isArray(parsed) ? { commands: parsed } : parsed
+        );
+      }
+    } catch {}
+  }
+
+  // 2. XML parameters <parameter name="..."> or <param name="...">
+  const args: Record<string, any> = {};
+  const pRegex =
+    /<(?:[|｜]+DSML[|｜]+)?(?:parameter|param)\s+name="([^"]+)"(?:\s+[^>]*)?>([\s\S]*?)(?:<\/(?:[|｜]+DSML[|｜]+)?(?:parameter|param)>|$)/gi;
+  let p: RegExpExecArray | null;
+  let hasParam = false;
+  while ((p = pRegex.exec(body)) !== null) {
+    hasParam = true;
+    const pName = p[1].trim();
+    const pVal = p[2].trim();
+    try {
+      if (
+        (pVal.startsWith("{") && pVal.endsWith("}")) ||
+        (pVal.startsWith("[") && pVal.endsWith("]"))
+      ) {
+        args[pName] = JSON.parse(pVal);
+      } else {
+        args[pName] = pVal;
+      }
+    } catch {
+      args[pName] = pVal;
+    }
+  }
+  if (hasParam) return normalizeToolArguments(toolName, args);
+
+  // 3. Direct XML tags e.g. <commands>...</commands>, <queries>...</queries>
+  const directTags = /<([a-zA-Z0-9_]+)>([\s\S]*?)<\/\1>/gi;
+  let dt: RegExpExecArray | null;
+  let hasTags = false;
+  while ((dt = directTags.exec(body)) !== null) {
+    if (
+      !["parameter", "param", "invoke", "invocation", "toolcall", "tool_call", "action"].includes(
+        dt[1]
+      )
+    ) {
+      hasTags = true;
+      let val = dt[2].trim();
+      try {
+        if (
+          (val.startsWith("{") && val.endsWith("}")) ||
+          (val.startsWith("[") && val.endsWith("]"))
+        ) {
+          args[dt[1]] = JSON.parse(val);
+        } else {
+          args[dt[1]] = val;
+        }
+      } catch {
+        args[dt[1]] = val;
+      }
+    }
+  }
+  if (hasTags) return normalizeToolArguments(toolName, args);
+
+  // 4. String fallback for single-string tools
+  if (toolName === "bash") return normalizeToolArguments(toolName, { command: cleaned });
+  if (toolName === "read") return normalizeToolArguments(toolName, { path: cleaned });
+  if (toolName === "ctx_execute") return normalizeToolArguments(toolName, { command: cleaned });
+  if (toolName === "ctx_search") return normalizeToolArguments(toolName, { query: cleaned });
+
+  return normalizeToolArguments(toolName, {});
+}
+
+function extractToolCallsFromText(
+  rawText: string,
+  availableToolNames?: Set<string>
+): {
   cleanText: string;
   toolCalls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }>;
 } {
   const toolCalls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> = [];
+  const tools = new Set<string>(KNOWN_BUILTIN_TOOLS);
+  if (availableToolNames) {
+    for (const t of availableToolNames) tools.add(t);
+  }
 
-  // Match any block starting with <*DSML*...> or <toolcall> or <tool_call> or <invocation>
-  const blockRegex =
-    /(?:<[|｜]+DSML[|｜]+[^>]*>|<toolcall>|<tool_call>|<invocation[^>]*>)([\s\S]*?)(?:<\/[|｜]+DSML[|｜]+[^>]*>|<\/toolcall>|<\/tool_call>|<\/invocation>|$)/gi;
+  let earliestToolIdx = -1;
+  const markEarliest = (idx: number) => {
+    if (idx !== -1 && (earliestToolIdx === -1 || idx < earliestToolIdx)) {
+      earliestToolIdx = idx;
+    }
+  };
 
-  let blockMatch: RegExpExecArray | null;
-  while ((blockMatch = blockRegex.exec(rawText)) !== null) {
-    const inner = blockMatch[1].trim();
+  // 1. Check container blocks: <...DSML...> ... </...DSML...>, <toolcall>...</toolcall>, <tool_call>...</tool_call>, <tool_calls>...</tool_calls>, <function_calls>...</function_calls>
+  const containerRegex =
+    /(?:<[|｜]+DSML[|｜]+[^>]*>|<tool_calls>|<function_calls>|<toolcall>|<tool_call>)([\s\S]*?)(?:<\/[|｜]+DSML[|｜]+[^>]*>|<\/tool_calls>|<\/function_calls>|<\/toolcall>|<\/tool_call>|$)/gi;
+  let cMatch: RegExpExecArray | null;
+  while ((cMatch = containerRegex.exec(rawText)) !== null) {
+    markEarliest(cMatch.index);
+    const inner = cMatch[1].trim();
     if (!inner) continue;
 
-    // 1. Check if there is an explicit invoke / invocation tag
+    // Check if inner is direct JSON for tool_call: {"name": "...", "arguments": ...}
+    let cleanedInner = inner.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+    if (cleanedInner.startsWith("{") && cleanedInner.endsWith("}")) {
+      try {
+        const parsed = JSON.parse(cleanedInner);
+        if (parsed.name) {
+          const tName = String(parsed.name).trim();
+          let tArgs = parsed.arguments !== undefined ? parsed.arguments : (parsed.parameters || {});
+          if (typeof tArgs === "string") {
+            try {
+              tArgs = JSON.parse(tArgs);
+            } catch {}
+          }
+          toolCalls.push({
+            id: "call_" + Math.random().toString(36).substring(2, 11),
+            type: "function",
+            function: {
+              name: tName,
+              arguments: JSON.stringify(
+                normalizeToolArguments(tName, typeof tArgs === "object" && tArgs !== null ? tArgs : {})
+              ),
+            },
+          });
+          continue;
+        }
+      } catch {}
+    }
+
+    // Check for invoke/invocation/action tags inside container
     const invokeRegex =
-      /<(?:[|｜]+DSML[|｜]+)?(?:invoke|invocation)\s+name="([^"]+)"(?:\s+[^>]*)?>([\s\S]*?)(?:<\/(?:[|｜]+DSML[|｜]+)?(?:invoke|invocation)>|$)/gi;
+      /<(?:[|｜]+DSML[|｜]+)?(?:invoke|invocation|action)\s+name="([^"]+)"(?:\s+[^>]*)?>([\s\S]*?)(?:<\/(?:[|｜]+DSML[|｜]+)?(?:invoke|invocation|action)>|$)/gi;
     let invMatch: RegExpExecArray | null;
     let foundInvoke = false;
-
     while ((invMatch = invokeRegex.exec(inner)) !== null) {
       foundInvoke = true;
-      let rawToolName = invMatch[1].trim();
-      // Normalize common lowercase tool names
-      const knownTools = [
-        "bash",
-        "read",
-        "write",
-        "edit",
-        "ask_user_question",
-        "todo",
-        "web_search",
-        "fetch_content",
-        "smart_recall",
-      ];
-      const toolName = knownTools.includes(rawToolName.toLowerCase())
-        ? rawToolName.toLowerCase()
-        : rawToolName;
-
-      const body = invMatch[2];
-      const args: Record<string, any> = {};
-
-      const pRegex =
-        /<(?:[|｜]+DSML[|｜]+)?(?:parameter|param)\s+name="([^"]+)"(?:\s+[^>]*)?>([\s\S]*?)(?:<\/(?:[|｜]+DSML[|｜]+)?(?:parameter|param)>|$)/gi;
-      let p: RegExpExecArray | null;
-      while ((p = pRegex.exec(body)) !== null) {
-        const pName = p[1].trim();
-        const pVal = p[2].trim();
-        try {
-          if (
-            (pVal.startsWith("{") && pVal.endsWith("}")) ||
-            (pVal.startsWith("[") && pVal.endsWith("]"))
-          ) {
-            args[pName] = JSON.parse(pVal);
-          } else {
-            args[pName] = pVal;
-          }
-        } catch {
-          args[pName] = pVal;
-        }
-      }
-
-      const directTags = /<([a-zA-Z0-9_]+)>([\s\S]*?)<\/\1>/gi;
-      let dt: RegExpExecArray | null;
-      while ((dt = directTags.exec(body)) !== null) {
-        if (!["parameter", "param", "invoke", "invocation", "toolcall", "tool_call"].includes(dt[1])) {
-          args[dt[1]] = dt[2].trim();
-        }
-      }
-
-      const normalizedArgs = normalizeToolArguments(toolName, args);
-
+      const toolName = invMatch[1].trim();
+      const args = parseArgsFromContent(invMatch[2], toolName);
       toolCalls.push({
         id: "call_" + Math.random().toString(36).substring(2, 11),
         type: "function",
         function: {
           name: toolName,
-          arguments: JSON.stringify(normalizedArgs),
+          arguments: JSON.stringify(args),
         },
       });
     }
 
-    // 2. If no invoke tag was found, check direct parameter tags
+    // Check for direct tool tags inside container (e.g. <ctx_batch_execute>...</ctx_batch_execute>)
     if (!foundInvoke) {
-      const cmdMatch = /<command>([\s\S]*?)<\/command>/i.exec(inner);
-      if (cmdMatch) {
-        const args = normalizeToolArguments("bash", { command: cmdMatch[1].trim() });
-        toolCalls.push({
-          id: "call_" + Math.random().toString(36).substring(2, 11),
-          type: "function",
-          function: {
-            name: "bash",
-            arguments: JSON.stringify(args),
-          },
-        });
-      } else {
-        const qMatch = /<questions>([\s\S]*?)<\/questions>/i.exec(inner);
-        if (qMatch) {
-          let qVal: any = qMatch[1].trim();
-          try {
-            qVal = JSON.parse(qVal);
-          } catch {}
-          const args = normalizeToolArguments("ask_user_question", { questions: qVal });
+      const tagRegex = /<([a-zA-Z0-9_.-]+)(?:\s+[^>]*)?>([\s\S]*?)<\/\1>/gi;
+      let tr: RegExpExecArray | null;
+      let foundDirectTag = false;
+      while ((tr = tagRegex.exec(inner)) !== null) {
+        const tName = tr[1].trim();
+        if (tools.has(tName) || tName.startsWith("ctx_")) {
+          foundDirectTag = true;
+          const args = parseArgsFromContent(tr[2], tName);
           toolCalls.push({
             id: "call_" + Math.random().toString(36).substring(2, 11),
             type: "function",
             function: {
-              name: "ask_user_question",
+              name: tName,
               arguments: JSON.stringify(args),
             },
           });
+        }
+      }
+
+      // Legacy parameter fallbacks inside container
+      if (!foundDirectTag) {
+        const cmdMatch = /<command>([\s\S]*?)<\/command>/i.exec(inner);
+        if (cmdMatch) {
+          toolCalls.push({
+            id: "call_" + Math.random().toString(36).substring(2, 11),
+            type: "function",
+            function: {
+              name: "bash",
+              arguments: JSON.stringify(normalizeToolArguments("bash", { command: cmdMatch[1].trim() })),
+            },
+          });
         } else {
-          const pathMatch = /<path>([\s\S]*?)<\/path>/i.exec(inner);
-          if (pathMatch) {
-            const args = normalizeToolArguments("read", { path: pathMatch[1].trim() });
+          const qMatch = /<questions>([\s\S]*?)<\/questions>/i.exec(inner);
+          if (qMatch) {
+            let qVal: any = qMatch[1].trim();
+            try {
+              qVal = JSON.parse(qVal);
+            } catch {}
             toolCalls.push({
               id: "call_" + Math.random().toString(36).substring(2, 11),
               type: "function",
               function: {
-                name: "read",
-                arguments: JSON.stringify(args),
+                name: "ask_user_question",
+                arguments: JSON.stringify(
+                  normalizeToolArguments("ask_user_question", { questions: qVal })
+                ),
               },
             });
+          } else {
+            const pathMatch = /<path>([\s\S]*?)<\/path>/i.exec(inner);
+            if (pathMatch) {
+              toolCalls.push({
+                id: "call_" + Math.random().toString(36).substring(2, 11),
+                type: "function",
+                function: {
+                  name: "read",
+                  arguments: JSON.stringify(normalizeToolArguments("read", { path: pathMatch[1].trim() })),
+                },
+              });
+            }
           }
         }
       }
     }
   }
 
-  // Deduplicate identical consecutive tool calls if model hallucinated/repeated
+  // 2. Standalone invoke tags outside containers: <invoke name="...">...</invoke>
+  const standaloneInvokeRegex =
+    /<(?:invoke|invocation|action)\s+name="([^"]+)"(?:\s+[^>]*)?>([\s\S]*?)(?:<\/(?:invoke|invocation|action)>|$)/gi;
+  let saMatch: RegExpExecArray | null;
+  while ((saMatch = standaloneInvokeRegex.exec(rawText)) !== null) {
+    markEarliest(saMatch.index);
+    const toolName = saMatch[1].trim();
+    const args = parseArgsFromContent(saMatch[2], toolName);
+    toolCalls.push({
+      id: "call_" + Math.random().toString(36).substring(2, 11),
+      type: "function",
+      function: {
+        name: toolName,
+        arguments: JSON.stringify(args),
+      },
+    });
+  }
+
+  // 3. Direct tool tags anywhere in rawText: <ctx_batch_execute>...</ctx_batch_execute>, <bash>...</bash>, etc.
+  const directToolRegex = /<([a-zA-Z0-9_.-]+)(?:\s+[^>]*)?>([\s\S]*?)(?:<\/\1>|$)/gi;
+  let dtMatch: RegExpExecArray | null;
+  while ((dtMatch = directToolRegex.exec(rawText)) !== null) {
+    const tagName = dtMatch[1].trim();
+    if (
+      /^(?:[|｜]+DSML[|｜]+.*|toolcall|tool_call|tool_calls|function_calls|invoke|invocation|action|parameter|param|questions|question|command|commands|queries|query|path|options|option)$/i.test(
+        tagName
+      )
+    ) {
+      continue;
+    }
+
+    if (tools.has(tagName) || tagName.startsWith("ctx_")) {
+      markEarliest(dtMatch.index);
+      const args = parseArgsFromContent(dtMatch[2], tagName);
+      toolCalls.push({
+        id: "call_" + Math.random().toString(36).substring(2, 11),
+        type: "function",
+        function: {
+          name: tagName,
+          arguments: JSON.stringify(args),
+        },
+      });
+    }
+  }
+
+  // Deduplicate identical consecutive tool calls
   const uniqueToolCalls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> = [];
   for (const tc of toolCalls) {
     const isDup = uniqueToolCalls.some(
@@ -493,10 +840,7 @@ function extractToolCallsFromText(rawText: string): {
     if (!isDup) uniqueToolCalls.push(tc);
   }
 
-  // Extract clean text (text before the first tool call block)
-  const firstBlockIdx = rawText.search(/(?:<[|｜]+DSML[|｜]+|<toolcall|<tool_call|<invocation)/i);
-  const cleanText = firstBlockIdx !== -1 ? rawText.slice(0, firstBlockIdx).trim() : rawText.trim();
-
+  const cleanText = earliestToolIdx !== -1 ? rawText.slice(0, earliestToolIdx).trim() : rawText.trim();
   return { cleanText, toolCalls: uniqueToolCalls };
 }
 
@@ -504,12 +848,17 @@ class DSMLStreamTransformer {
   private inDSML = false;
   private dsmlBuffer = "";
   private carry = "";
+  private toolStartRegex: RegExp;
+  private hasNativeToolCalls = false;
 
   constructor(
     private res: http.ServerResponse,
     private id: string,
-    private model: string
-  ) {}
+    private model: string,
+    private availableToolNames?: Set<string>
+  ) {
+    this.toolStartRegex = buildToolStartRegex(this.availableToolNames);
+  }
 
   feedReasoning(reasoning: string) {
     if (!reasoning) return;
@@ -529,6 +878,19 @@ class DSMLStreamTransformer {
     this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
   }
 
+  feedNativeToolCalls(toolCalls: any[]) {
+    if (!Array.isArray(toolCalls) || toolCalls.length === 0) return;
+    this.hasNativeToolCalls = true;
+    const chunk = {
+      id: this.id,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: this.model,
+      choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: null }],
+    };
+    this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+  }
+
   feedText(text: string) {
     if (this.inDSML) {
       this.dsmlBuffer += text;
@@ -536,19 +898,24 @@ class DSMLStreamTransformer {
     }
 
     const combined = this.carry + text;
-    const dsmlMatch = /(?:<[|｜]+DSML[|｜]+|<toolcall|<tool_call|<invocation)/i.exec(combined);
+    const toolMatch = this.toolStartRegex.exec(combined);
 
-    if (dsmlMatch) {
+    if (toolMatch) {
       this.inDSML = true;
-      const pre = combined.slice(0, dsmlMatch.index);
+      const pre = combined.slice(0, toolMatch.index);
       if (pre.length > 0) {
         this.emitContentDelta(pre);
       }
-      this.dsmlBuffer = combined.slice(dsmlMatch.index);
+      this.dsmlBuffer = combined.slice(toolMatch.index);
       this.carry = "";
     } else {
       const partialIdx = combined.lastIndexOf("<");
-      if (partialIdx !== -1 && combined.length - partialIdx < 25) {
+      if (
+        partialIdx !== -1 &&
+        !combined.slice(partialIdx).includes(">") &&
+        combined.length - partialIdx < 80 &&
+        /^<[a-zA-Z0-9_|/: -]*$/.test(combined.slice(partialIdx))
+      ) {
         const emitText = combined.slice(0, partialIdx);
         this.carry = combined.slice(partialIdx);
         if (emitText.length > 0) {
@@ -582,19 +949,43 @@ class DSMLStreamTransformer {
       this.carry = "";
     }
 
-    if (this.inDSML || /(?:<[|｜]+DSML[|｜]+|<toolcall|<tool_call|<invocation)/i.test(this.dsmlBuffer)) {
-      const { toolCalls } = extractToolCallsFromText(this.dsmlBuffer);
+    if (this.hasNativeToolCalls) {
+      const endChunk = {
+        id: this.id,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model: this.model,
+        choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+      };
+      this.res.write(`data: ${JSON.stringify(endChunk)}\n\n`);
+      this.res.write("data: [DONE]\n\n");
+      return;
+    }
+
+    if (this.inDSML || this.toolStartRegex.test(this.dsmlBuffer)) {
+      const { toolCalls } = extractToolCallsFromText(this.dsmlBuffer, this.availableToolNames);
       if (toolCalls.length > 0) {
+        const formattedToolCalls = toolCalls.map((tc, idx) => ({
+          index: idx,
+          id: tc.id,
+          type: "function" as const,
+          function: tc.function,
+        }));
         const chunk = {
           id: this.id,
           object: "chat.completion.chunk",
           created: Math.floor(Date.now() / 1000),
           model: this.model,
-          choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: "tool_calls" }],
+          choices: [{ index: 0, delta: { tool_calls: formattedToolCalls }, finish_reason: "tool_calls" }],
         };
         this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
         this.res.write("data: [DONE]\n\n");
         return;
+      } else {
+        // Fallback: if tool parsing produced 0 calls, never drop the buffer silently!
+        if (this.dsmlBuffer.length > 0) {
+          this.emitContentDelta(this.dsmlBuffer);
+        }
       }
     }
 
@@ -1223,6 +1614,52 @@ class TokenPool {
     await Promise.allSettled(promises);
   }
 
+  async getDetailedPoolStatus() {
+    const now = Date.now();
+    await Promise.allSettled(this.pool.map((p) => p.client.fetchSessionInfo()));
+
+    return this.pool.map((p, idx) => {
+      const session = p.client.getSessionCache();
+      const fb = session?.freebucks;
+      const balance = typeof fb?.balance === "number" ? fb.balance : null;
+      const dailyRemaining =
+        typeof fb?.daily?.remaining === "number" ? fb.daily.remaining : null;
+      const dailyLimit =
+        typeof fb?.daily?.limit === "number"
+          ? fb.daily.limit
+          : typeof fb?.daily?.granted === "number"
+          ? fb.daily.granted
+          : null;
+
+      const hasActive = Boolean(
+        session && session.instanceId && session.expiresAt > now + 15000
+      );
+      const remainingMins = hasActive
+        ? Math.max(0, Math.ceil((session!.expiresAt - now) / 60000))
+        : 0;
+
+      return {
+        index: idx,
+        name: p.name,
+        token: p.token,
+        maskedToken: p.token.slice(0, 6) + "..." + p.token.slice(-4),
+        isActive: idx === this.activeIndex,
+        isBanned: p.isBanned,
+        inCooldown: p.cooldownUntil > now,
+        cooldownMinutes:
+          p.cooldownUntil > now ? Math.ceil((p.cooldownUntil - now) / 60000) : 0,
+        requests: p.requestCount,
+        balance,
+        dailyRemaining,
+        dailyLimit,
+        activeModel: hasActive ? prettyModelName(session!.model) : null,
+        remainingMins,
+        countryCode: session?.countryCode,
+        countryBlockReason: session?.countryBlockReason,
+      };
+    });
+  }
+
   getPoolStatus() {
     const now = Date.now();
     return this.pool.map((p, idx) => ({
@@ -1453,18 +1890,34 @@ export default async function (pi: ExtensionAPI) {
             console.error("Payload keys:", Object.keys(payload));
             if (payload.tools) console.error("Tools count:", payload.tools.length);
           }
+
+          // Capture all available tool names from client before removing tools
+          const availableToolNames = new Set<string>(KNOWN_BUILTIN_TOOLS);
+          if (Array.isArray(payload.tools)) {
+            for (const t of payload.tools) {
+              const name = t?.function?.name || t?.name;
+              if (typeof name === "string" && name.trim()) {
+                availableToolNames.add(name.trim());
+              }
+            }
+          }
+
           const requestedModel = payload.model || "deepseek/deepseek-v4-flash-0731";
           const upstreamModel = MODEL_ALIASES[requestedModel] || requestedModel;
           const agentId = AGENT_MAP[requestedModel] || AGENT_MAP[upstreamModel] || "base3-free-deepseek-flash";
 
-          // Inject Buffy system marker
+          // Inject Buffy system marker and tool documentation
           const marker = getBuffyMarker(upstreamModel);
-          const messages = Array.isArray(payload.messages) ? payload.messages : [];
+          const toolsPrompt = formatToolsForSystemPrompt(payload.tools);
+          const fullMarker = toolsPrompt ? `${marker}\n\n${toolsPrompt}` : marker;
+          let messages = Array.isArray(payload.messages) ? payload.messages : [];
           if (messages.length > 0 && messages[0].role === "system") {
-            messages[0].content = `${marker}\n\n${messages[0].content}`;
+            messages[0].content = `${fullMarker}\n\n${messages[0].content}`;
           } else {
-            messages.unshift({ role: "system", content: marker });
+            messages.unshift({ role: "system", content: fullMarker });
           }
+          // Normalize messages for upstream: reconstruct tool calls into assistant XML and convert role: "tool" to user results
+          messages = normalizeMessagesForUpstream(messages);
           payload.messages = messages;
           payload.model = upstreamModel; // Send upstream-compatible model ID
 
@@ -1626,11 +2079,12 @@ export default async function (pi: ExtensionAPI) {
           if (!isStream) {
             const data = (await upstreamRes.json()) as any;
             const choice = data.choices?.[0];
-            if (
-              choice?.message?.content &&
-              /(?:<[|｜]+DSML[|｜]+|<toolcall|<tool_call|<invocation)/i.test(choice.message.content)
-            ) {
-              const { cleanText, toolCalls } = extractToolCallsFromText(choice.message.content);
+            const toolRegex = buildToolStartRegex(availableToolNames);
+            if (choice?.message?.content && toolRegex.test(choice.message.content)) {
+              const { cleanText, toolCalls } = extractToolCallsFromText(
+                choice.message.content,
+                availableToolNames
+              );
               if (toolCalls.length > 0) {
                 choice.message.content = cleanText || null;
                 choice.message.tool_calls = toolCalls;
@@ -1682,7 +2136,8 @@ export default async function (pi: ExtensionAPI) {
           const transformer = new DSMLStreamTransformer(
             res,
             "chatcmpl-" + Math.random().toString(36).substring(2, 12),
-            requestedModel
+            requestedModel,
+            availableToolNames
           );
 
           const decoder = new TextDecoder();
@@ -1711,6 +2166,9 @@ export default async function (pi: ExtensionAPI) {
                     }
                     if (delta?.content) {
                       transformer.feedText(delta.content);
+                    }
+                    if (delta?.tool_calls) {
+                      transformer.feedNativeToolCalls(delta.tool_calls);
                     }
                   } catch {}
                 }
@@ -1952,91 +2410,87 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      // 7. Subcommand: /freebuff status / list / default interactive menu
-      await activeClient?.fetchSessionInfo();
-      const poolStatus = pool.getPoolStatus();
-      const activeAccount = poolStatus.find((p) => p.isActive);
+      // 7. Default: account dashboard + interactive menu
+      const accounts = await pool.getDetailedPoolStatus();
+      const activeAcc = accounts.find((a) => a.isActive);
+      const hasActive = Boolean(activeAcc?.activeModel);
+      const remainingMins = activeAcc?.remainingMins ?? 0;
       const session = activeClient?.getSessionCache();
-      const now = Date.now();
-      const hasActive = Boolean(
-        session && session.instanceId && session.expiresAt > now + 15000
-      );
-      const remainingMins = hasActive
-        ? Math.max(0, Math.ceil((session!.expiresAt - now) / 60000))
-        : 0;
 
-      const accountLines = poolStatus.map(
-        (p) =>
-          `[${p.isActive ? "ACTIVE" : "STANDBY"}] ${p.name} - ${p.requests} reqs${
-            p.isBanned ? " (BANNED)" : p.inCooldown ? ` (COOLDOWN ${p.cooldownMinutes}m)` : ""
-          }`
-      );
+      const divider = "─".repeat(50);
+      const accountCards = accounts
+        .map((a) => {
+          const tag = a.isBanned
+            ? "[BANNED  ]"
+            : a.inCooldown
+            ? `[COOLDOWN ${a.cooldownMinutes}m]`
+            : a.isActive
+            ? "[ACTIVE  ]"
+            : "[STANDBY ]";
+          const coins = a.balance !== null ? `${a.balance}` : "?";
+          const daily =
+            a.dailyRemaining !== null && a.dailyLimit !== null
+              ? `Daily: ${a.dailyRemaining}/${a.dailyLimit}`
+              : "Daily: ?";
+          const sessionLine = a.activeModel
+            ? `${a.activeModel} (${a.remainingMins}m left)`
+            : "None (Idle)";
+          const lines = [
+            `${tag}  ${a.name}  (${a.maskedToken})`,
+            `           Freebucks : ${coins} coins  |  ${daily}`,
+            `           Session   : ${sessionLine}`,
+            `           Traffic   : ${a.requests} request(s) served`,
+          ];
+          if (a.countryBlockReason) {
+            lines.push(`           ! ${a.countryCode ?? ""}:  ${a.countryBlockReason}`);
+          }
+          return lines.join("\n");
+        })
+        .join("\n\n");
 
-      const infoLines = [
-        `Provider: Freebuff (Embedded Native - No Docker)`,
-        `Token Pool: ${pool.size} account(s) loaded`,
-        ...accountLines,
-        `Active Account: ${activeAccount?.name || "None"}`,
-      ];
+      const headerLine = hasActive
+        ? `  Active: ${prettyModelName(activeAcc!.activeModel!)}  |  ${remainingMins}m remaining`
+        : "  No Active Session  |  Select an action below:";
 
-      const creditsLine = formatCreditsLine(session ?? null);
-      if (creditsLine) {
-        infoLines.push(creditsLine);
-      }
-
-      if (hasActive) {
-        infoLines.push(
-          `Active Model: ${prettyModelName(session!.model)} (${remainingMins}m remaining)`
-        );
-        infoLines.push(`Session ID: ${session!.instanceId}`);
-      } else {
-        infoLines.push("Active Session: None (Type /freebuff start to rent a model)");
-      }
-
-      if (session?.countryBlockReason) {
-        infoLines.push(
-          `⚠ Country: ${session.countryCode || "unknown"} (${session.countryBlockReason}) — this account region may be restricted upstream`
-        );
-      }
+      const dashboardTitle = [
+        divider,
+        "  FREEBUFF ACCOUNT DASHBOARD",
+        divider,
+        accountCards,
+        divider,
+        headerLine,
+      ].join("\n");
 
       if (ctx.hasUI) {
-        let menuTitle = "Freebuff [No Active Session | Select Model to Start]:";
         const menuOptions: string[] = [];
-
         if (hasActive) {
-          menuTitle = `Freebuff [Active: ${prettyModelName(session!.model)} | ${remainingMins}m left]:`;
           menuOptions.push(
-            `[Active] ${prettyModelName(session!.model)} (${remainingMins}m remaining)`
+            `[Active] ${prettyModelName(activeAcc!.activeModel!)} (${remainingMins}m left)`
           );
           menuOptions.push("[Switch] Rent Different Model (New 1-Hour Session)");
-          menuOptions.push("[End] Release / Cancel Active Session");
+          menuOptions.push("[End] Release Active Session");
         } else {
           menuOptions.push("[Start] Rent 1-Hour Session (Select Model)");
         }
-
-        if (pool.size > 1) {
-          menuOptions.push("[Rotate] Switch to next standby account");
+        if (accounts.length > 1) {
+          menuOptions.push("[Rotate] Switch to Next Standby Account");
         }
-        menuOptions.push("[Status] View Balance & Accounts Pool");
-        menuOptions.push("[Token] Add Auth Token / Login (freebuff.llm.pm)");
+        menuOptions.push("[Status] Show Dashboard in Notification");
+        menuOptions.push("[Token] Add Auth Token / Login");
         menuOptions.push("Close");
 
-        const choice = await ctx.ui.select(menuTitle, menuOptions);
-        if (
-          choice &&
-          (choice.startsWith("[Start]") || choice.startsWith("[Switch]"))
-        ) {
-          const balance = session?.freebucks?.balance ?? "?";
+        const choice = await ctx.ui.select(dashboardTitle, menuOptions);
 
-          const options = availableModels.map((m) => {
+        if (choice && (choice.startsWith("[Start]") || choice.startsWith("[Switch]"))) {
+          const balance = session?.freebucks?.balance ?? "?";
+          const modelOptions = availableModels.map((m) => {
             const price = getModelPrice(session ?? null, m);
             const priceText = price !== null ? `${price} Freebucks/hr` : "Standard";
             return `${prettyModelName(m)} (${priceText}) -> ${m}`;
           });
-
           const picked = await ctx.ui.select(
             `Select Model to Rent for 1 Hour (Balance: ${balance}):`,
-            [...options, "Cancel"]
+            [...modelOptions, "Cancel"]
           );
           if (picked && picked !== "Cancel") {
             const targetModel = picked.split(" -> ")[1]?.trim();
@@ -2071,7 +2525,7 @@ export default async function (pi: ExtensionAPI) {
             "info"
           );
         } else if (choice && choice.startsWith("[Status]")) {
-          ctx.ui.notify(infoLines.join("\n"), "info");
+          ctx.ui.notify(dashboardTitle, "info");
         } else if (choice && choice.startsWith("[Token]")) {
           ctx.ui.notify(
             "Login Link: https://freebuff.llm.pm\nLog in with your account to get your token.",
@@ -2090,7 +2544,7 @@ export default async function (pi: ExtensionAPI) {
           }
         }
       } else {
-        ctx.ui.notify(infoLines.join("\n"), "info");
+        ctx.ui.notify(dashboardTitle, "info");
       }
     },
   });
