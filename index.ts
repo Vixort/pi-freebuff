@@ -248,6 +248,68 @@ or the standard DSML tool format:
 If you need to inspect, explore, search, read files, or run commands to complete the task, you MUST invoke the tool immediately in your response turn. NEVER output conversational filler saying what you plan to do and stop your turn without calling the tool. Call the tool immediately.`;
 }
 
+function schemaToCompactSignature(name: string, description: string, parameters?: any): string {
+  const props = parameters?.properties;
+  if (!props || typeof props !== "object" || Object.keys(props).length === 0) {
+    let sig = `### Tool: \`${name}()\``;
+    if (description) sig += `\n${description}`;
+    return sig;
+  }
+
+  const requiredList: string[] = Array.isArray(parameters?.required) ? parameters.required : [];
+  const requiredSet = new Set(requiredList);
+
+  const formatType = (schema: any): string => {
+    if (!schema || typeof schema !== "object") return "any";
+    if (Array.isArray(schema.enum)) {
+      return schema.enum.map((v: any) => JSON.stringify(v)).join(" | ");
+    }
+    if (schema.type === "array") {
+      const itemType = schema.items ? formatType(schema.items) : "any";
+      return itemType.includes("|") ? `(${itemType})[]` : `${itemType}[]`;
+    }
+    if (schema.type === "object") {
+      if (schema.properties && typeof schema.properties === "object") {
+        const inner = Object.entries(schema.properties)
+          .map(([k, v]: [string, any]) => {
+            const isReq = Array.isArray(schema.required) && schema.required.includes(k);
+            return `${k}${isReq ? "" : "?"}: ${formatType(v)}`;
+          })
+          .join("; ");
+        return `{ ${inner} }`;
+      }
+      return "Record<string, any>";
+    }
+    if (schema.type === "string") return "string";
+    if (schema.type === "number" || schema.type === "integer") return "number";
+    if (schema.type === "boolean") return "boolean";
+    return schema.type || "any";
+  };
+
+  const paramSignatures: string[] = [];
+  const paramDocs: string[] = [];
+
+  for (const [propName, propSchema] of Object.entries(props) as [string, any][]) {
+    const isRequired = requiredSet.has(propName);
+    const typeStr = formatType(propSchema);
+    paramSignatures.push(`${propName}${isRequired ? "" : "?"}: ${typeStr}`);
+    if (propSchema?.description) {
+      paramDocs.push(`  - \`${propName}\`: ${String(propSchema.description).trim()}`);
+    }
+  }
+
+  const sig = `### Tool: \`${name}(${paramSignatures.join(", ")})\``;
+  const docLines: string[] = [];
+  if (description) {
+    docLines.push(description);
+  }
+  if (paramDocs.length > 0) {
+    docLines.push(`Parameters:\n${paramDocs.join("\n")}`);
+  }
+
+  return `${sig}\n${docLines.join("\n")}`.trim();
+}
+
 function formatToolsForSystemPrompt(tools?: any[]): string {
   if (!Array.isArray(tools) || tools.length === 0) return "";
 
@@ -257,13 +319,17 @@ function formatToolsForSystemPrompt(tools?: any[]): string {
     if (!fn || !fn.name) continue;
     const name = String(fn.name).trim();
     const desc = fn.description ? String(fn.description).trim() : "";
-    let paramsStr = "{}";
-    if (fn.parameters) {
-      try {
-        paramsStr = JSON.stringify(fn.parameters, null, 2);
-      } catch {}
+    try {
+      toolSections.push(schemaToCompactSignature(name, desc, fn.parameters));
+    } catch {
+      let paramsStr = "{}";
+      if (fn.parameters) {
+        try {
+          paramsStr = JSON.stringify(fn.parameters, null, 2);
+        } catch {}
+      }
+      toolSections.push(`### Tool: \`${name}\`\n${desc ? desc + "\n" : ""}Parameters JSON Schema:\n\`\`\`json\n${paramsStr}\n\`\`\``);
     }
-    toolSections.push(`### Tool: \`${name}\`\n${desc ? desc + "\n" : ""}Parameters JSON Schema:\n\`\`\`json\n${paramsStr}\n\`\`\``);
   }
 
   if (toolSections.length === 0) return "";
@@ -561,23 +627,127 @@ function normalizeToolArguments(toolName: string, args: Record<string, any>): Re
   return args;
 }
 
+function repairJson(raw: string): any {
+  if (!raw || typeof raw !== "string") return null;
+
+  let str = raw.trim();
+
+  // Strip markdown code fences
+  str = str.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+
+  // Fast path: try native JSON.parse first
+  try {
+    return JSON.parse(str);
+  } catch {}
+
+  // 1. Remove JavaScript style comments // ... and /* ... */
+  str = str.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^\\])\/\/.*$/gm, "$1");
+
+  // 2. Remove trailing commas before } or ]
+  str = str.replace(/,\s*([}\]])/g, "$1");
+
+  // 3. Fix unquoted property names: { foo: "bar" } or , foo: 123
+  str = str.replace(/([{,]\s*)([a-zA-Z0-9_$]+)\s*:/g, '$1"$2":');
+
+  // 4. Handle single quotes for strings: replace '...' with "..."
+  str = str.replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_match, p1) => {
+    return `"${p1.replace(/"/g, '\\"')}"`;
+  });
+
+  // Try parsing after basic cleanup
+  try {
+    return JSON.parse(str);
+  } catch {}
+
+  // 5. Balance unclosed brackets and braces using LIFO stack (e.g. truncated tool outputs)
+  const stack: string[] = [];
+  let inString = false;
+  let escape = false;
+
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (!inString) {
+      if (ch === "{") stack.push("}");
+      else if (ch === "[") stack.push("]");
+      else if (ch === "}") {
+        if (stack.length > 0 && stack[stack.length - 1] === "}") stack.pop();
+      } else if (ch === "]") {
+        if (stack.length > 0 && stack[stack.length - 1] === "]") stack.pop();
+      }
+    }
+  }
+
+  // If in unclosed string, close the quote
+  let balanced = str;
+  if (inString) {
+    balanced += '"';
+  }
+  // Remove any trailing comma before closing
+  balanced = balanced.replace(/,\s*$/, "");
+  // Close delimiters in exact LIFO nesting order
+  while (stack.length > 0) {
+    balanced += stack.pop();
+  }
+
+  try {
+    return JSON.parse(balanced);
+  } catch {}
+
+  // 6. Extraction fallback: try to find the outermost valid { ... } or [ ... ]
+  const firstBrace = str.indexOf("{");
+  const firstBracket = str.indexOf("[");
+  let startIdx = -1;
+  let isObject = true;
+
+  if (firstBrace !== -1 && (firstBracket === -1 || firstBrace < firstBracket)) {
+    startIdx = firstBrace;
+    isObject = true;
+  } else if (firstBracket !== -1) {
+    startIdx = firstBracket;
+    isObject = false;
+  }
+
+  if (startIdx !== -1) {
+    const sub = str.slice(startIdx);
+    for (let endIdx = sub.length; endIdx > 0; endIdx--) {
+      const ch = sub[endIdx - 1];
+      if ((isObject && ch === "}") || (!isObject && ch === "]")) {
+        const candidate = sub.slice(0, endIdx);
+        try {
+          return JSON.parse(candidate);
+        } catch {}
+      }
+    }
+  }
+
+  return null;
+}
+
 function parseArgsFromContent(body: string, toolName: string): Record<string, any> {
   let cleaned = (body || "").trim();
   if (cleaned.startsWith("```")) {
     cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
   }
 
-  // 1. Direct JSON (object or array)
-  if ((cleaned.startsWith("{") && cleaned.endsWith("}")) || (cleaned.startsWith("[") && cleaned.endsWith("]"))) {
-    try {
-      const parsed = JSON.parse(cleaned);
-      if (typeof parsed === "object" && parsed !== null) {
-        return normalizeToolArguments(
-          toolName,
-          Array.isArray(parsed) ? { commands: parsed } : parsed
-        );
-      }
-    } catch {}
+  // 1. Direct JSON (object or array) or repaired JSON
+  const repaired = repairJson(cleaned);
+  if (repaired && typeof repaired === "object") {
+    return normalizeToolArguments(
+      toolName,
+      Array.isArray(repaired) ? { commands: repaired } : repaired
+    );
   }
 
   // 2. XML parameters <parameter name="..."> or <param name="...">
@@ -590,16 +760,10 @@ function parseArgsFromContent(body: string, toolName: string): Record<string, an
     hasParam = true;
     const pName = p[1].trim();
     const pVal = p[2].trim();
-    try {
-      if (
-        (pVal.startsWith("{") && pVal.endsWith("}")) ||
-        (pVal.startsWith("[") && pVal.endsWith("]"))
-      ) {
-        args[pName] = JSON.parse(pVal);
-      } else {
-        args[pName] = pVal;
-      }
-    } catch {
+    const parsedVal = repairJson(pVal);
+    if (parsedVal !== null && typeof parsedVal === "object") {
+      args[pName] = parsedVal;
+    } else {
       args[pName] = pVal;
     }
   }
@@ -617,16 +781,10 @@ function parseArgsFromContent(body: string, toolName: string): Record<string, an
     ) {
       hasTags = true;
       let val = dt[2].trim();
-      try {
-        if (
-          (val.startsWith("{") && val.endsWith("}")) ||
-          (val.startsWith("[") && val.endsWith("]"))
-        ) {
-          args[dt[1]] = JSON.parse(val);
-        } else {
-          args[dt[1]] = val;
-        }
-      } catch {
+      const parsedVal = repairJson(val);
+      if (parsedVal !== null && typeof parsedVal === "object") {
+        args[dt[1]] = parsedVal;
+      } else {
         args[dt[1]] = val;
       }
     }
@@ -640,6 +798,89 @@ function parseArgsFromContent(body: string, toolName: string): Record<string, an
   if (toolName === "ctx_search") return normalizeToolArguments(toolName, { query: cleaned });
 
   return normalizeToolArguments(toolName, {});
+}
+
+function detectHeuristicToolCalls(
+  text: string,
+  availableTools: Set<string>
+): Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> {
+  if (!text || text.length < 5) return [];
+
+  const synthesized: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> = [];
+
+  // 1. File reading heuristic
+  // Matches: "อ่านไฟล์ src/router.ts", "ดูไฟล์ components/App.tsx", "check file src/index.ts", "read file /foo/bar.json"
+  const fileReadRegex =
+    /(?:จะ|ขอ)?(?:อ่านไฟล์|ดูไฟล์|ตรวจสอบไฟล์|เปิดไฟล์|read(?:\s+the)?\s+file|inspect(?:\s+the)?\s+file|check(?:\s+the)?\s+file|cat\s+file)\s*[:`'"\s]*([a-zA-Z0-9_./\\-]+\.(?:tsx?|jsx?|json|md|php|py|go|rs|html?|s?css|ya?ml|sh|env|toml|sql)\b)[`'"\s]*/i;
+  const fileMatch = fileReadRegex.exec(text);
+
+  if (fileMatch && fileMatch[1]) {
+    const filePath = fileMatch[1].trim();
+    if (availableTools.has("read")) {
+      synthesized.push({
+        id: "call_heur_" + Math.random().toString(36).substring(2, 9),
+        type: "function",
+        function: {
+          name: "read",
+          arguments: JSON.stringify({ path: filePath }),
+        },
+      });
+    } else if (availableTools.has("ctx_batch_execute")) {
+      synthesized.push({
+        id: "call_heur_" + Math.random().toString(36).substring(2, 9),
+        type: "function",
+        function: {
+          name: "ctx_batch_execute",
+          arguments: JSON.stringify({
+            commands: [{ command: `cat ${filePath}`, label: `read ${filePath}` }],
+          }),
+        },
+      });
+    } else if (availableTools.has("bash")) {
+      synthesized.push({
+        id: "call_heur_" + Math.random().toString(36).substring(2, 9),
+        type: "function",
+        function: {
+          name: "bash",
+          arguments: JSON.stringify({ command: `cat ${filePath}` }),
+        },
+      });
+    }
+  }
+
+  // 2. Command execution heuristic
+  // Matches: "รันคำสั่ง `npm test`", "run command `git status`", "execute `ls -la`"
+  if (synthesized.length === 0) {
+    const cmdRegex =
+      /(?:จะ|ขอ)?(?:รันคำสั่ง|รันคอมมานด์|สั่งรัน|run(?:\s+the)?\s+command|execute(?:\s+the)?\s+command)\s*[:\s]*`([^`\n\r]+)`/i;
+    const cmdMatch = cmdRegex.exec(text);
+    if (cmdMatch && cmdMatch[1]) {
+      const command = cmdMatch[1].trim();
+      if (availableTools.has("bash")) {
+        synthesized.push({
+          id: "call_heur_" + Math.random().toString(36).substring(2, 9),
+          type: "function",
+          function: {
+            name: "bash",
+            arguments: JSON.stringify({ command }),
+          },
+        });
+      } else if (availableTools.has("ctx_batch_execute")) {
+        synthesized.push({
+          id: "call_heur_" + Math.random().toString(36).substring(2, 9),
+          type: "function",
+          function: {
+            name: "ctx_batch_execute",
+            arguments: JSON.stringify({
+              commands: [{ command, label: command.slice(0, 30) }],
+            }),
+          },
+        });
+      }
+    }
+  }
+
+  return synthesized;
 }
 
 function extractToolCallsFromText(
@@ -840,6 +1081,17 @@ function extractToolCallsFromText(
     if (!isDup) uniqueToolCalls.push(tc);
   }
 
+  // Safety Heuristic Intent Fallback: if model announced intent without XML tags
+  if (uniqueToolCalls.length === 0) {
+    const heuristics = detectHeuristicToolCalls(rawText, tools);
+    if (heuristics.length > 0) {
+      console.log(
+        `[Freebuff Tool Fallback] Model announced intent without XML tags; synthesized tool call: ${heuristics[0].function.name}`
+      );
+      return { cleanText: rawText.trim(), toolCalls: heuristics };
+    }
+  }
+
   const cleanText = earliestToolIdx !== -1 ? rawText.slice(0, earliestToolIdx).trim() : rawText.trim();
   return { cleanText, toolCalls: uniqueToolCalls };
 }
@@ -850,6 +1102,8 @@ class DSMLStreamTransformer {
   private carry = "";
   private toolStartRegex: RegExp;
   private hasNativeToolCalls = false;
+  private emittedToolCallCount = 0;
+  private fullTextBuffer = "";
 
   constructor(
     private res: http.ServerResponse,
@@ -894,6 +1148,7 @@ class DSMLStreamTransformer {
   feedText(text: string) {
     if (this.inDSML) {
       this.dsmlBuffer += text;
+      this.checkAndEmitEarlyToolCalls();
       return;
     }
 
@@ -908,6 +1163,7 @@ class DSMLStreamTransformer {
       }
       this.dsmlBuffer = combined.slice(toolMatch.index);
       this.carry = "";
+      this.checkAndEmitEarlyToolCalls();
     } else {
       const partialIdx = combined.lastIndexOf("<");
       if (
@@ -929,6 +1185,7 @@ class DSMLStreamTransformer {
   }
 
   private emitContentDelta(content: string) {
+    this.fullTextBuffer += content;
     const chunk = {
       id: this.id,
       object: "chat.completion.chunk",
@@ -937,6 +1194,46 @@ class DSMLStreamTransformer {
       choices: [{ index: 0, delta: { content }, finish_reason: null }],
     };
     this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+  }
+
+  private checkAndEmitEarlyToolCalls() {
+    // Only check if closing tag is found in dsmlBuffer
+    if (!/<\/(?:[a-zA-Z0-9_.-]+|[|｜]+DSML[|｜]+[^>]*)>/i.test(this.dsmlBuffer)) {
+      return;
+    }
+
+    const { toolCalls } = extractToolCallsFromText(this.dsmlBuffer, this.availableToolNames);
+    if (toolCalls.length > this.emittedToolCallCount) {
+      const newCalls = toolCalls.slice(this.emittedToolCallCount);
+      for (let i = 0; i < newCalls.length; i++) {
+        const globalIdx = this.emittedToolCallCount + i;
+        const tc = newCalls[i];
+        const chunk = {
+          id: this.id,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: this.model,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: globalIdx,
+                    id: tc.id,
+                    type: "function" as const,
+                    function: tc.function,
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        };
+        this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      }
+      this.emittedToolCallCount = toolCalls.length;
+    }
   }
 
   finish() {
@@ -964,21 +1261,39 @@ class DSMLStreamTransformer {
 
     if (this.inDSML || this.toolStartRegex.test(this.dsmlBuffer)) {
       const { toolCalls } = extractToolCallsFromText(this.dsmlBuffer, this.availableToolNames);
-      if (toolCalls.length > 0) {
-        const formattedToolCalls = toolCalls.map((tc, idx) => ({
-          index: idx,
-          id: tc.id,
-          type: "function" as const,
-          function: tc.function,
-        }));
-        const chunk = {
+      if (toolCalls.length > this.emittedToolCallCount) {
+        const remaining = toolCalls.slice(this.emittedToolCallCount);
+        for (let i = 0; i < remaining.length; i++) {
+          const globalIdx = this.emittedToolCallCount + i;
+          const tc = remaining[i];
+          const chunk = {
+            id: this.id,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: this.model,
+            choices: [
+              {
+                index: globalIdx,
+                id: tc.id,
+                type: "function" as const,
+                function: tc.function,
+              },
+            ],
+          };
+          this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        }
+        this.emittedToolCallCount = toolCalls.length;
+      }
+
+      if (this.emittedToolCallCount > 0) {
+        const endChunk = {
           id: this.id,
           object: "chat.completion.chunk",
           created: Math.floor(Date.now() / 1000),
           model: this.model,
-          choices: [{ index: 0, delta: { tool_calls: formattedToolCalls }, finish_reason: "tool_calls" }],
+          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
         };
-        this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        this.res.write(`data: ${JSON.stringify(endChunk)}\n\n`);
         this.res.write("data: [DONE]\n\n");
         return;
       } else {
@@ -986,6 +1301,50 @@ class DSMLStreamTransformer {
         if (this.dsmlBuffer.length > 0) {
           this.emitContentDelta(this.dsmlBuffer);
         }
+      }
+    }
+
+    // Heuristic Intent Fallback for streaming when model outputted intent without XML tags
+    if (this.emittedToolCallCount === 0 && this.availableToolNames && this.availableToolNames.size > 0) {
+      const heuristics = detectHeuristicToolCalls(this.fullTextBuffer, this.availableToolNames);
+      if (heuristics.length > 0) {
+        console.log(
+          `[Freebuff Tool Fallback] Streamed text contained tool intent without XML tags; synthesized tool call: ${heuristics[0].function.name}`
+        );
+        const tc = heuristics[0];
+        const chunk = {
+          id: this.id,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: this.model,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: tc.id,
+                    type: "function" as const,
+                    function: tc.function,
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        };
+        this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        const endChunk = {
+          id: this.id,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: this.model,
+          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+        };
+        this.res.write(`data: ${JSON.stringify(endChunk)}\n\n`);
+        this.res.write("data: [DONE]\n\n");
+        return;
       }
     }
 
@@ -1906,10 +2265,28 @@ export default async function (pi: ExtensionAPI) {
           const upstreamModel = MODEL_ALIASES[requestedModel] || requestedModel;
           const agentId = AGENT_MAP[requestedModel] || AGENT_MAP[upstreamModel] || "base3-free-deepseek-flash";
 
+          // Translate and enforce tool_choice directive
+          let toolChoiceDirective = "";
+          if (payload.tool_choice) {
+            if (payload.tool_choice === "required") {
+              toolChoiceDirective = `\n# CRITICAL MANDATE: TOOL CALL REQUIRED\nYou MUST invoke at least one tool in this turn using the tool calling XML format. It is strictly forbidden to answer with text only without calling a tool.`;
+            } else if (payload.tool_choice === "none") {
+              toolChoiceDirective = `\n# CRITICAL MANDATE: NO TOOLS\nYou MUST NOT call any tools in this turn. Respond with plain text only. Do NOT output any XML tool tags.`;
+            } else if (typeof payload.tool_choice === "object" && payload.tool_choice.function?.name) {
+              const forcedTool = payload.tool_choice.function.name;
+              toolChoiceDirective = `\n# CRITICAL MANDATE: FORCED TOOL EXECUTION\nYou MUST invoke the specific tool \`${forcedTool}\` in this turn using its XML format. Do NOT skip calling this tool.`;
+            } else if (typeof payload.tool_choice === "string" && payload.tool_choice !== "auto") {
+              toolChoiceDirective = `\n# CRITICAL MANDATE: FORCED TOOL EXECUTION\nYou MUST invoke the tool \`${payload.tool_choice}\` in this turn.`;
+            }
+          }
+
           // Inject Buffy system marker and tool documentation
           const marker = getBuffyMarker(upstreamModel);
           const toolsPrompt = formatToolsForSystemPrompt(payload.tools);
-          const fullMarker = toolsPrompt ? `${marker}\n\n${toolsPrompt}` : marker;
+          let fullMarker = toolsPrompt ? `${marker}\n\n${toolsPrompt}` : marker;
+          if (toolChoiceDirective) {
+            fullMarker = `${fullMarker}\n\n${toolChoiceDirective}`;
+          }
           let messages = Array.isArray(payload.messages) ? payload.messages : [];
           if (messages.length > 0 && messages[0].role === "system") {
             messages[0].content = `${fullMarker}\n\n${messages[0].content}`;
