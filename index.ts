@@ -360,6 +360,7 @@ Or using standard DSML format:
 - FORBIDDEN: Outputting conversational text like "ขั้นตอนที่ 2: อ่านไฟล์ src/router.ts ครับ" and stopping without calling the tool!
 - MANDATORY: If you announce an intention to inspect or read files (e.g. "ดู route ทั้งหมดจาก src/router.ts และ src/App.tsx ครับ"), you MUST include the tool call tag (<read> or <ctx_batch_execute> or <bash>) immediately in that same message.
 - Stopping without emitting a tool call breaks the agent loop and causes immediate failure.
+- CROSS-PLATFORM COMPATIBILITY: Always use forward slashes (/) for file paths (e.g. "src/utils/file.ts" or "C:/project/src"). Forward slashes work natively and reliably on both Windows and Linux, avoiding backslash escape bugs.
 
 3. Autonomous Multi-Turn Example:
 User: "Analyze the project structure and routes"
@@ -435,6 +436,7 @@ function normalizeMessagesForUpstream(messages: any[]): any[] {
 
 const KNOWN_BUILTIN_TOOLS = new Set<string>([
   "bash",
+  "powershell",
   "read",
   "write",
   "edit",
@@ -540,27 +542,52 @@ function normalizeToolArguments(toolName: string, args: Record<string, any>): Re
     });
   }
 
-  // 2. Tool: bash
-  if (toolName === "bash") {
-    args.command = String(
+  // 2. Tool: bash & powershell
+  if (toolName === "bash" || toolName === "powershell") {
+    let cmd = String(
       args.command || args.cmd || args.code || args.script || ""
-    ).trim();
+    );
+    // Normalize Windows CRLF to LF and remove carriage returns
+    cmd = cmd.replace(/\r\n/g, "\n").replace(/\r/g, "");
+
+    // Unwrap accidental raw JSON strings if fallback leaked
+    if (cmd.startsWith("{") && cmd.includes('"command"')) {
+      try {
+        const parsed = JSON.parse(cmd);
+        if (parsed.command) cmd = String(parsed.command);
+      } catch {
+        const m = /"command"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(cmd);
+        if (m) cmd = m[1].replace(/\\"/g, '"');
+      }
+    }
+
+    // For bash: normalize Windows paths with backslashes to forward slashes
+    if (toolName === "bash") {
+      cmd = cmd.replace(/([a-zA-Z]:)\\(?![\s;&|])/g, "$1/");
+      cmd = cmd.replace(/(?<=[a-zA-Z0-9_.-])\\(?=[a-zA-Z0-9_.-])/g, "/");
+    }
+
+    args.command = cmd.trim();
   }
 
   // 3. Tool: read
   if (toolName === "read") {
+    if (typeof args.path === "string") args.path = args.path.replace(/\\/g, "/");
     if (args.offset !== undefined) args.offset = parseInt(String(args.offset), 10) || 0;
     if (args.limit !== undefined) args.limit = parseInt(String(args.limit), 10) || 0;
   }
 
-  // 4. Tool: write
-  if (toolName === "write") {
-    args.content =
-      args.content !== undefined
-        ? String(args.content)
-        : args.code !== undefined
-        ? String(args.code)
-        : "";
+  // 4. Tool: write & edit
+  if (toolName === "write" || toolName === "edit") {
+    if (typeof args.path === "string") args.path = args.path.replace(/\\/g, "/");
+    if (toolName === "write") {
+      args.content =
+        args.content !== undefined
+          ? String(args.content)
+          : args.code !== undefined
+          ? String(args.code)
+          : "";
+    }
   }
 
   // 5. Tool: todo
@@ -636,6 +663,18 @@ function repairJson(raw: string): any {
   str = str.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
 
   // Fast path: try native JSON.parse first
+  try {
+    return JSON.parse(str);
+  } catch {}
+
+  // Sanitize Windows backslashes inside JSON strings:
+  // 1. Convert Windows drive paths like C:\foo\bar or C:\\foo\\bar to C:/foo/bar
+  str = str.replace(/([a-zA-Z]:\\\\?)([^"\n\r]*)/g, (_m, drive, rest) => {
+    return drive[0] + ":/" + rest.replace(/\\\\?/g, "/");
+  });
+  // 2. Escape orphan unescaped backslashes not followed by valid JSON escape char
+  str = str.replace(/\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})/g, "\\\\");
+
   try {
     return JSON.parse(str);
   } catch {}
@@ -792,7 +831,7 @@ function parseArgsFromContent(body: string, toolName: string): Record<string, an
   if (hasTags) return normalizeToolArguments(toolName, args);
 
   // 4. String fallback for single-string tools
-  if (toolName === "bash") return normalizeToolArguments(toolName, { command: cleaned });
+  if (toolName === "bash" || toolName === "powershell") return normalizeToolArguments(toolName, { command: cleaned });
   if (toolName === "read") return normalizeToolArguments(toolName, { path: cleaned });
   if (toolName === "ctx_execute") return normalizeToolArguments(toolName, { command: cleaned });
   if (toolName === "ctx_search") return normalizeToolArguments(toolName, { query: cleaned });
@@ -845,6 +884,15 @@ function detectHeuristicToolCalls(
           arguments: JSON.stringify({ command: `cat ${filePath}` }),
         },
       });
+    } else if (availableTools.has("powershell")) {
+      synthesized.push({
+        id: "call_heur_" + Math.random().toString(36).substring(2, 9),
+        type: "function",
+        function: {
+          name: "powershell",
+          arguments: JSON.stringify({ command: `Get-Content ${filePath}` }),
+        },
+      });
     }
   }
 
@@ -862,6 +910,15 @@ function detectHeuristicToolCalls(
           type: "function",
           function: {
             name: "bash",
+            arguments: JSON.stringify({ command }),
+          },
+        });
+      } else if (availableTools.has("powershell")) {
+        synthesized.push({
+          id: "call_heur_" + Math.random().toString(36).substring(2, 9),
+          type: "function",
+          function: {
+            name: "powershell",
             arguments: JSON.stringify({ command }),
           },
         });
@@ -984,12 +1041,13 @@ function extractToolCallsFromText(
       if (!foundDirectTag) {
         const cmdMatch = /<command>([\s\S]*?)<\/command>/i.exec(inner);
         if (cmdMatch) {
+          const shellTool = tools.has("powershell") && !tools.has("bash") ? "powershell" : "bash";
           toolCalls.push({
             id: "call_" + Math.random().toString(36).substring(2, 11),
             type: "function",
             function: {
-              name: "bash",
-              arguments: JSON.stringify(normalizeToolArguments("bash", { command: cmdMatch[1].trim() })),
+              name: shellTool,
+              arguments: JSON.stringify(normalizeToolArguments(shellTool, { command: cmdMatch[1].trim() })),
             },
           });
         } else {
