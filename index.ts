@@ -1163,6 +1163,8 @@ class DSMLStreamTransformer {
   private emittedToolCallCount = 0;
   private fullTextBuffer = "";
 
+  private totalReasoningLength = 0;
+
   constructor(
     private res: http.ServerResponse,
     private id: string,
@@ -1172,8 +1174,17 @@ class DSMLStreamTransformer {
     this.toolStartRegex = buildToolStartRegex(this.availableToolNames);
   }
 
+  getMetrics() {
+    return {
+      completionChars: this.fullTextBuffer.length + this.dsmlBuffer.length,
+      reasoningChars: this.totalReasoningLength,
+      toolCallsCount: this.emittedToolCallCount,
+    };
+  }
+
   feedReasoning(reasoning: string) {
     if (!reasoning) return;
+    this.totalReasoningLength += reasoning.length;
     const chunk = {
       id: this.id,
       object: "chat.completion.chunk",
@@ -1552,6 +1563,231 @@ function isUserExplicitlyStopped(): boolean {
 
 function setUserExplicitlyStopped(val: boolean): void {
   userExplicitlyStopped = val;
+}
+
+// ==========================================
+// Token Usage & Cost Savings Analytics Engine
+// ==========================================
+
+interface ModelStats {
+  requests: number;
+  promptTokens: number;
+  completionTokens: number;
+  reasoningTokens: number;
+  toolCalls: number;
+  savedUsd: number;
+}
+
+interface FreebuffStats {
+  totalRequests: number;
+  totalPromptTokens: number;
+  totalCompletionTokens: number;
+  totalReasoningTokens: number;
+  totalToolCalls: number;
+  totalSavedUsd: number;
+  firstUsedAt: number;
+  lastUsedAt: number;
+  byModel: Record<string, ModelStats>;
+}
+
+const MODEL_PRICING: Record<string, { prompt: number; completion: number }> = {
+  // Anthropic Claude
+  "anthropic/claude-3-7-sonnet": { prompt: 3.0, completion: 15.0 },
+  "anthropic/claude-3.7-sonnet": { prompt: 3.0, completion: 15.0 },
+  "anthropic/claude-3-5-sonnet": { prompt: 3.0, completion: 15.0 },
+  "anthropic/claude-3.5-sonnet": { prompt: 3.0, completion: 15.0 },
+  "anthropic/claude-3-5-haiku": { prompt: 0.8, completion: 4.0 },
+  "anthropic/claude-3.5-haiku": { prompt: 0.8, completion: 4.0 },
+  "anthropic/claude-3-haiku": { prompt: 0.25, completion: 1.25 },
+  "anthropic/claude-3-opus": { prompt: 15.0, completion: 75.0 },
+  // OpenAI
+  "openai/gpt-4o": { prompt: 2.5, completion: 10.0 },
+  "openai/gpt-4o-mini": { prompt: 0.15, completion: 0.6 },
+  "openai/o3-mini": { prompt: 1.1, completion: 4.4 },
+  "openai/o1": { prompt: 15.0, completion: 60.0 },
+  "openai/o1-mini": { prompt: 1.1, completion: 4.4 },
+  // DeepSeek
+  "deepseek/deepseek-r1": { prompt: 0.55, completion: 2.19 },
+  "deepseek/deepseek-chat": { prompt: 0.14, completion: 0.28 },
+  "deepseek/deepseek-v4-flash-0731": { prompt: 0.14, completion: 0.28 },
+  // Google Gemini
+  "google/gemini-2.5-pro": { prompt: 1.25, completion: 5.0 },
+  "google/gemini-2.5-flash": { prompt: 0.15, completion: 0.6 },
+  "google/gemini-2.0-flash": { prompt: 0.1, completion: 0.4 },
+  "google/gemini-1.5-pro": { prompt: 1.25, completion: 5.0 },
+  "google/gemini-1.5-flash": { prompt: 0.075, completion: 0.3 },
+  // Qwen
+  "qwen/qwen-2.5-coder-32b": { prompt: 0.2, completion: 0.6 },
+  // Default fallback
+  default: { prompt: 1.5, completion: 6.0 },
+};
+
+function getStatsDiskPath(): string {
+  return path.join(os.homedir(), ".config", "manicode", "freebuff-stats.json");
+}
+
+let inMemoryStats: FreebuffStats | null = null;
+
+function createEmptyStats(): FreebuffStats {
+  return {
+    totalRequests: 0,
+    totalPromptTokens: 0,
+    totalCompletionTokens: 0,
+    totalReasoningTokens: 0,
+    totalToolCalls: 0,
+    totalSavedUsd: 0,
+    firstUsedAt: Date.now(),
+    lastUsedAt: Date.now(),
+    byModel: {},
+  };
+}
+
+function loadFreebuffStats(): FreebuffStats {
+  if (inMemoryStats) return inMemoryStats;
+  try {
+    const p = getStatsDiskPath();
+    if (fs.existsSync(p)) {
+      const data = JSON.parse(fs.readFileSync(p, "utf8"));
+      inMemoryStats = {
+        totalRequests: Number(data.totalRequests) || 0,
+        totalPromptTokens: Number(data.totalPromptTokens) || 0,
+        totalCompletionTokens: Number(data.totalCompletionTokens) || 0,
+        totalReasoningTokens: Number(data.totalReasoningTokens) || 0,
+        totalToolCalls: Number(data.totalToolCalls) || 0,
+        totalSavedUsd: Number(data.totalSavedUsd) || 0,
+        firstUsedAt: Number(data.firstUsedAt) || Date.now(),
+        lastUsedAt: Number(data.lastUsedAt) || Date.now(),
+        byModel: typeof data.byModel === "object" && data.byModel !== null ? data.byModel : {},
+      };
+      return inMemoryStats;
+    }
+  } catch {}
+  inMemoryStats = createEmptyStats();
+  return inMemoryStats;
+}
+
+function saveFreebuffStats(stats: FreebuffStats): void {
+  inMemoryStats = stats;
+  try {
+    const p = getStatsDiskPath();
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, JSON.stringify(stats, null, 2), { mode: 0o600 });
+  } catch {}
+}
+
+function resetFreebuffStats(): void {
+  inMemoryStats = createEmptyStats();
+  saveFreebuffStats(inMemoryStats);
+}
+
+function estimatePromptTokens(messages: any[]): number {
+  if (!Array.isArray(messages)) return 0;
+  let totalChars = 0;
+  for (const m of messages) {
+    if (typeof m.content === "string") totalChars += m.content.length;
+    else if (Array.isArray(m.content)) {
+      for (const part of m.content) {
+        if (typeof part?.text === "string") totalChars += part.text.length;
+      }
+    }
+  }
+  return Math.max(1, Math.round(totalChars / 3.8) + messages.length * 4);
+}
+
+function recordRequestUsage(
+  model: string,
+  promptTokens: number,
+  completionTokens: number,
+  reasoningTokens: number,
+  toolCalls: number
+): void {
+  const stats = loadFreebuffStats();
+  const normalizedModel = MODEL_ALIASES[model] || model;
+  const pricing = MODEL_PRICING[normalizedModel] || MODEL_PRICING[model] || MODEL_PRICING.default;
+
+  const promptCost = (promptTokens / 1_000_000) * pricing.prompt;
+  const completionCost = ((completionTokens + reasoningTokens) / 1_000_000) * pricing.completion;
+  const savedUsd = promptCost + completionCost;
+
+  stats.totalRequests += 1;
+  stats.totalPromptTokens += promptTokens;
+  stats.totalCompletionTokens += completionTokens;
+  stats.totalReasoningTokens += reasoningTokens;
+  stats.totalToolCalls += toolCalls;
+  stats.totalSavedUsd += savedUsd;
+  stats.lastUsedAt = Date.now();
+
+  if (!stats.byModel[normalizedModel]) {
+    stats.byModel[normalizedModel] = {
+      requests: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      reasoningTokens: 0,
+      toolCalls: 0,
+      savedUsd: 0,
+    };
+  }
+
+  const mStats = stats.byModel[normalizedModel];
+  mStats.requests += 1;
+  mStats.promptTokens += promptTokens;
+  mStats.completionTokens += completionTokens;
+  mStats.reasoningTokens += reasoningTokens;
+  mStats.toolCalls += toolCalls;
+  mStats.savedUsd += savedUsd;
+
+  saveFreebuffStats(stats);
+}
+
+function formatTokenCount(n: number): string {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + "M";
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + "k";
+  return String(n);
+}
+
+function formatStatsSummary(): string {
+  const stats = loadFreebuffStats();
+  const usd = stats.totalSavedUsd;
+  const thb = (usd * 34.0).toFixed(1);
+  const totalTokens = stats.totalPromptTokens + stats.totalCompletionTokens + stats.totalReasoningTokens;
+
+  const lines: string[] = [];
+  lines.push("╔══════════════════════════════════════════════════════════════════════╗");
+  lines.push("║              📊 Freebuff Token & Cost Savings Analytics              ║");
+  lines.push("╚══════════════════════════════════════════════════════════════════════╝");
+  lines.push(` 💰 Estimated API Cost Saved : $${usd.toFixed(2)} USD (~฿${thb} THB)`);
+  lines.push(` ⚡ Total Requests Served    : ${stats.totalRequests} requests`);
+  lines.push(` 🔤 Total Tokens Processed   : ${formatTokenCount(totalTokens)} (${totalTokens.toLocaleString()} tokens)`);
+  lines.push(`    ├─ Prompt / Input Tokens : ${formatTokenCount(stats.totalPromptTokens)} (${stats.totalPromptTokens.toLocaleString()})`);
+  lines.push(`    ├─ Completion / Output   : ${formatTokenCount(stats.totalCompletionTokens)} (${stats.totalCompletionTokens.toLocaleString()})`);
+  if (stats.totalReasoningTokens > 0) {
+    lines.push(`    └─ Reasoning / Thinking  : ${formatTokenCount(stats.totalReasoningTokens)} (${stats.totalReasoningTokens.toLocaleString()})`);
+  }
+  lines.push(` 🛠️  Tool Calls Synthesized   : ${stats.totalToolCalls} calls`);
+
+  const models = Object.keys(stats.byModel).sort(
+    (a, b) => stats.byModel[b].savedUsd - stats.byModel[a].savedUsd
+  );
+
+  if (models.length > 0) {
+    lines.push("");
+    lines.push(" 📈 Usage Breakdown by Model:");
+    for (const m of models) {
+      const ms = stats.byModel[m];
+      const mTotal = ms.promptTokens + ms.completionTokens + ms.reasoningTokens;
+      const mName = prettyModelName(m);
+      lines.push(
+        `  • ${mName.padEnd(20)} : ${ms.requests} reqs | ${formatTokenCount(mTotal)} tokens | Saved $${ms.savedUsd.toFixed(2)}`
+      );
+    }
+  }
+
+  const startDate = new Date(stats.firstUsedAt).toLocaleString();
+  lines.push("");
+  lines.push(` Active Tracking since: ${startDate}`);
+  lines.push(" Run '/freebuff stats reset' to clear recorded metrics.");
+
+  return lines.join("\n");
 }
 
 class CodebuffClient {
@@ -2600,6 +2836,8 @@ export default async function (pi: ExtensionAPI) {
             return;
           }
 
+          const estimatedPromptTokens = estimatePromptTokens(payload.messages);
+
           if (!isStream) {
             const data = (await upstreamRes.json()) as any;
             const choice = data.choices?.[0];
@@ -2621,6 +2859,26 @@ export default async function (pi: ExtensionAPI) {
               await activeRunInfo.client.finishRun(activeRunInfo.runId);
               activeRunInfo = null;
             }
+
+            // Record Token & Cost Analytics for non-streaming request
+            try {
+              const promptTokens = data.usage?.prompt_tokens ?? estimatedPromptTokens;
+              const completionTokens =
+                data.usage?.completion_tokens ??
+                Math.max(1, Math.round((choice?.message?.content?.length || 0) / 3.8));
+              const reasoningTokens =
+                data.usage?.completion_tokens_details?.reasoning_tokens ?? 0;
+              const toolCallsCount = Array.isArray(choice?.message?.tool_calls)
+                ? choice.message.tool_calls.length
+                : 0;
+              recordRequestUsage(
+                requestedModel,
+                promptTokens,
+                completionTokens,
+                reasoningTokens,
+                toolCallsCount
+              );
+            } catch {}
             return;
           }
 
@@ -2664,6 +2922,7 @@ export default async function (pi: ExtensionAPI) {
             availableToolNames
           );
 
+          let upstreamUsage: any = null;
           const decoder = new TextDecoder();
           let sseBuffer = "";
 
@@ -2684,6 +2943,9 @@ export default async function (pi: ExtensionAPI) {
 
                   try {
                     const parsed = JSON.parse(dataStr);
+                    if (parsed.usage) {
+                      upstreamUsage = parsed.usage;
+                    }
                     const delta = parsed.choices?.[0]?.delta;
                     if (delta?.reasoning_content) {
                       transformer.feedReasoning(delta.reasoning_content);
@@ -2701,6 +2963,26 @@ export default async function (pi: ExtensionAPI) {
               transformer.finish();
               res.end();
               await cleanup();
+
+              // Record Token & Cost Analytics for streaming request
+              try {
+                const metrics = transformer.getMetrics();
+                const promptTokens = upstreamUsage?.prompt_tokens ?? estimatedPromptTokens;
+                const completionTokens =
+                  upstreamUsage?.completion_tokens ??
+                  Math.max(1, Math.round(metrics.completionChars / 3.8));
+                const reasoningTokens =
+                  upstreamUsage?.completion_tokens_details?.reasoning_tokens ??
+                  Math.round(metrics.reasoningChars / 3.8);
+                const toolCallsCount = metrics.toolCallsCount;
+                recordRequestUsage(
+                  requestedModel,
+                  promptTokens,
+                  completionTokens,
+                  reasoningTokens,
+                  toolCallsCount
+                );
+              } catch {}
             }
           };
 
@@ -2997,7 +3279,19 @@ async function checkAndAutoRenewSession(pool: TokenPool): Promise<void> {
         return;
       }
 
-      // 7. Subcommand: /freebuff help
+      // 7. Subcommand: /freebuff stats [reset]
+      if (sub === "stats" || sub === "usage") {
+        const action = parts[1]?.toLowerCase();
+        if (action === "reset" || action === "clear") {
+          resetFreebuffStats();
+          ctx.ui.notify("Freebuff token metrics and cost savings have been reset.", "info");
+          return;
+        }
+        ctx.ui.notify(formatStatsSummary(), "info");
+        return;
+      }
+
+      // 8. Subcommand: /freebuff help
       if (sub === "help") {
         const helpText = [
           "Freebuff Commands Guide:",
@@ -3008,6 +3302,8 @@ async function checkAndAutoRenewSession(pool: TokenPool): Promise<void> {
           "/freebuff auto-session on - Enable auto-renewal using last-used model",
           "/freebuff auto-session off- Disable auto-renewal (manual rental only)",
           "/freebuff stop            - Release current cloud session",
+          "/freebuff stats           - View total tokens processed & estimated USD/THB savings",
+          "/freebuff stats reset     - Reset recorded token and cost statistics",
           "/freebuff status          - View accounts, Freebucks balance & countdown",
           "/freebuff login           - Open login link & prompt to paste token",
           "/freebuff add <token>     - Add an auth token to the account pool",
@@ -3064,9 +3360,14 @@ async function checkAndAutoRenewSession(pool: TokenPool): Promise<void> {
         ? `  Active: ${prettyModelName(activeAcc!.activeModel!)}  |  ${remainingMins}m remaining`
         : "  No Active Session  |  Select an action below:";
 
+      const stats = loadFreebuffStats();
+      const totalTokens = stats.totalPromptTokens + stats.totalCompletionTokens + stats.totalReasoningTokens;
+      const statsSummaryLine = `  💰 Savings: $${stats.totalSavedUsd.toFixed(2)} USD (~฿${(stats.totalSavedUsd * 34).toFixed(0)}) | ⚡ ${formatTokenCount(totalTokens)} Tokens (${stats.totalRequests} reqs)`;
+
       const dashboardTitle = [
         divider,
         "  FREEBUFF ACCOUNT DASHBOARD",
+        statsSummaryLine,
         divider,
         accountCards,
         divider,
@@ -3091,6 +3392,7 @@ async function checkAndAutoRenewSession(pool: TokenPool): Promise<void> {
           ? "[Auto-Session] Toggle OFF (Currently: ENABLED)"
           : "[Auto-Session] Toggle ON (Currently: DISABLED)";
         menuOptions.push(autoLabel);
+        menuOptions.push("[Stats] View Token Usage & Cost Savings");
         menuOptions.push("[Status] Show Dashboard in Notification");
         menuOptions.push("[Token] Add Auth Token / Login");
         menuOptions.push("Close");
@@ -3157,6 +3459,8 @@ async function checkAndAutoRenewSession(pool: TokenPool): Promise<void> {
               : "Could not rotate to another account.",
             "info"
           );
+        } else if (choice && choice.startsWith("[Stats]")) {
+          ctx.ui.notify(formatStatsSummary(), "info");
         } else if (choice && choice.startsWith("[Status]")) {
           ctx.ui.notify(dashboardTitle, "info");
         } else if (choice && choice.startsWith("[Token]")) {
