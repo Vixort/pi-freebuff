@@ -248,6 +248,68 @@ or the standard DSML tool format:
 If you need to inspect, explore, search, read files, or run commands to complete the task, you MUST invoke the tool immediately in your response turn. NEVER output conversational filler saying what you plan to do and stop your turn without calling the tool. Call the tool immediately.`;
 }
 
+function schemaToCompactSignature(name: string, description: string, parameters?: any): string {
+  const props = parameters?.properties;
+  if (!props || typeof props !== "object" || Object.keys(props).length === 0) {
+    let sig = `### Tool: \`${name}()\``;
+    if (description) sig += `\n${description}`;
+    return sig;
+  }
+
+  const requiredList: string[] = Array.isArray(parameters?.required) ? parameters.required : [];
+  const requiredSet = new Set(requiredList);
+
+  const formatType = (schema: any): string => {
+    if (!schema || typeof schema !== "object") return "any";
+    if (Array.isArray(schema.enum)) {
+      return schema.enum.map((v: any) => JSON.stringify(v)).join(" | ");
+    }
+    if (schema.type === "array") {
+      const itemType = schema.items ? formatType(schema.items) : "any";
+      return itemType.includes("|") ? `(${itemType})[]` : `${itemType}[]`;
+    }
+    if (schema.type === "object") {
+      if (schema.properties && typeof schema.properties === "object") {
+        const inner = Object.entries(schema.properties)
+          .map(([k, v]: [string, any]) => {
+            const isReq = Array.isArray(schema.required) && schema.required.includes(k);
+            return `${k}${isReq ? "" : "?"}: ${formatType(v)}`;
+          })
+          .join("; ");
+        return `{ ${inner} }`;
+      }
+      return "Record<string, any>";
+    }
+    if (schema.type === "string") return "string";
+    if (schema.type === "number" || schema.type === "integer") return "number";
+    if (schema.type === "boolean") return "boolean";
+    return schema.type || "any";
+  };
+
+  const paramSignatures: string[] = [];
+  const paramDocs: string[] = [];
+
+  for (const [propName, propSchema] of Object.entries(props) as [string, any][]) {
+    const isRequired = requiredSet.has(propName);
+    const typeStr = formatType(propSchema);
+    paramSignatures.push(`${propName}${isRequired ? "" : "?"}: ${typeStr}`);
+    if (propSchema?.description) {
+      paramDocs.push(`  - \`${propName}\`: ${String(propSchema.description).trim()}`);
+    }
+  }
+
+  const sig = `### Tool: \`${name}(${paramSignatures.join(", ")})\``;
+  const docLines: string[] = [];
+  if (description) {
+    docLines.push(description);
+  }
+  if (paramDocs.length > 0) {
+    docLines.push(`Parameters:\n${paramDocs.join("\n")}`);
+  }
+
+  return `${sig}\n${docLines.join("\n")}`.trim();
+}
+
 function formatToolsForSystemPrompt(tools?: any[]): string {
   if (!Array.isArray(tools) || tools.length === 0) return "";
 
@@ -257,13 +319,17 @@ function formatToolsForSystemPrompt(tools?: any[]): string {
     if (!fn || !fn.name) continue;
     const name = String(fn.name).trim();
     const desc = fn.description ? String(fn.description).trim() : "";
-    let paramsStr = "{}";
-    if (fn.parameters) {
-      try {
-        paramsStr = JSON.stringify(fn.parameters, null, 2);
-      } catch {}
+    try {
+      toolSections.push(schemaToCompactSignature(name, desc, fn.parameters));
+    } catch {
+      let paramsStr = "{}";
+      if (fn.parameters) {
+        try {
+          paramsStr = JSON.stringify(fn.parameters, null, 2);
+        } catch {}
+      }
+      toolSections.push(`### Tool: \`${name}\`\n${desc ? desc + "\n" : ""}Parameters JSON Schema:\n\`\`\`json\n${paramsStr}\n\`\`\``);
     }
-    toolSections.push(`### Tool: \`${name}\`\n${desc ? desc + "\n" : ""}Parameters JSON Schema:\n\`\`\`json\n${paramsStr}\n\`\`\``);
   }
 
   if (toolSections.length === 0) return "";
@@ -294,6 +360,7 @@ Or using standard DSML format:
 - FORBIDDEN: Outputting conversational text like "ขั้นตอนที่ 2: อ่านไฟล์ src/router.ts ครับ" and stopping without calling the tool!
 - MANDATORY: If you announce an intention to inspect or read files (e.g. "ดู route ทั้งหมดจาก src/router.ts และ src/App.tsx ครับ"), you MUST include the tool call tag (<read> or <ctx_batch_execute> or <bash>) immediately in that same message.
 - Stopping without emitting a tool call breaks the agent loop and causes immediate failure.
+- CROSS-PLATFORM COMPATIBILITY: Always use forward slashes (/) for file paths (e.g. "src/utils/file.ts" or "C:/project/src"). Forward slashes work natively and reliably on both Windows and Linux, avoiding backslash escape bugs.
 
 3. Autonomous Multi-Turn Example:
 User: "Analyze the project structure and routes"
@@ -369,6 +436,7 @@ function normalizeMessagesForUpstream(messages: any[]): any[] {
 
 const KNOWN_BUILTIN_TOOLS = new Set<string>([
   "bash",
+  "powershell",
   "read",
   "write",
   "edit",
@@ -474,27 +542,52 @@ function normalizeToolArguments(toolName: string, args: Record<string, any>): Re
     });
   }
 
-  // 2. Tool: bash
-  if (toolName === "bash") {
-    args.command = String(
+  // 2. Tool: bash & powershell
+  if (toolName === "bash" || toolName === "powershell") {
+    let cmd = String(
       args.command || args.cmd || args.code || args.script || ""
-    ).trim();
+    );
+    // Normalize Windows CRLF to LF and remove carriage returns
+    cmd = cmd.replace(/\r\n/g, "\n").replace(/\r/g, "");
+
+    // Unwrap accidental raw JSON strings if fallback leaked
+    if (cmd.startsWith("{") && cmd.includes('"command"')) {
+      try {
+        const parsed = JSON.parse(cmd);
+        if (parsed.command) cmd = String(parsed.command);
+      } catch {
+        const m = /"command"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(cmd);
+        if (m) cmd = m[1].replace(/\\"/g, '"');
+      }
+    }
+
+    // For bash: normalize Windows paths with backslashes to forward slashes
+    if (toolName === "bash") {
+      cmd = cmd.replace(/([a-zA-Z]:)\\(?![\s;&|])/g, "$1/");
+      cmd = cmd.replace(/(?<=[a-zA-Z0-9_.-])\\(?=[a-zA-Z0-9_.-])/g, "/");
+    }
+
+    args.command = cmd.trim();
   }
 
   // 3. Tool: read
   if (toolName === "read") {
+    if (typeof args.path === "string") args.path = args.path.replace(/\\/g, "/");
     if (args.offset !== undefined) args.offset = parseInt(String(args.offset), 10) || 0;
     if (args.limit !== undefined) args.limit = parseInt(String(args.limit), 10) || 0;
   }
 
-  // 4. Tool: write
-  if (toolName === "write") {
-    args.content =
-      args.content !== undefined
-        ? String(args.content)
-        : args.code !== undefined
-        ? String(args.code)
-        : "";
+  // 4. Tool: write & edit
+  if (toolName === "write" || toolName === "edit") {
+    if (typeof args.path === "string") args.path = args.path.replace(/\\/g, "/");
+    if (toolName === "write") {
+      args.content =
+        args.content !== undefined
+          ? String(args.content)
+          : args.code !== undefined
+          ? String(args.code)
+          : "";
+    }
   }
 
   // 5. Tool: todo
@@ -561,23 +654,139 @@ function normalizeToolArguments(toolName: string, args: Record<string, any>): Re
   return args;
 }
 
+function repairJson(raw: string): any {
+  if (!raw || typeof raw !== "string") return null;
+
+  let str = raw.trim();
+
+  // Strip markdown code fences
+  str = str.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+
+  // Fast path: try native JSON.parse first
+  try {
+    return JSON.parse(str);
+  } catch {}
+
+  // Sanitize Windows backslashes inside JSON strings:
+  // 1. Convert Windows drive paths like C:\foo\bar or C:\\foo\\bar to C:/foo/bar
+  str = str.replace(/([a-zA-Z]:\\\\?)([^"\n\r]*)/g, (_m, drive, rest) => {
+    return drive[0] + ":/" + rest.replace(/\\\\?/g, "/");
+  });
+  // 2. Escape orphan unescaped backslashes not followed by valid JSON escape char
+  str = str.replace(/\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})/g, "\\\\");
+
+  try {
+    return JSON.parse(str);
+  } catch {}
+
+  // 1. Remove JavaScript style comments // ... and /* ... */
+  str = str.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^\\])\/\/.*$/gm, "$1");
+
+  // 2. Remove trailing commas before } or ]
+  str = str.replace(/,\s*([}\]])/g, "$1");
+
+  // 3. Fix unquoted property names: { foo: "bar" } or , foo: 123
+  str = str.replace(/([{,]\s*)([a-zA-Z0-9_$]+)\s*:/g, '$1"$2":');
+
+  // 4. Handle single quotes for strings: replace '...' with "..."
+  str = str.replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_match, p1) => {
+    return `"${p1.replace(/"/g, '\\"')}"`;
+  });
+
+  // Try parsing after basic cleanup
+  try {
+    return JSON.parse(str);
+  } catch {}
+
+  // 5. Balance unclosed brackets and braces using LIFO stack (e.g. truncated tool outputs)
+  const stack: string[] = [];
+  let inString = false;
+  let escape = false;
+
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (!inString) {
+      if (ch === "{") stack.push("}");
+      else if (ch === "[") stack.push("]");
+      else if (ch === "}") {
+        if (stack.length > 0 && stack[stack.length - 1] === "}") stack.pop();
+      } else if (ch === "]") {
+        if (stack.length > 0 && stack[stack.length - 1] === "]") stack.pop();
+      }
+    }
+  }
+
+  // If in unclosed string, close the quote
+  let balanced = str;
+  if (inString) {
+    balanced += '"';
+  }
+  // Remove any trailing comma before closing
+  balanced = balanced.replace(/,\s*$/, "");
+  // Close delimiters in exact LIFO nesting order
+  while (stack.length > 0) {
+    balanced += stack.pop();
+  }
+
+  try {
+    return JSON.parse(balanced);
+  } catch {}
+
+  // 6. Extraction fallback: try to find the outermost valid { ... } or [ ... ]
+  const firstBrace = str.indexOf("{");
+  const firstBracket = str.indexOf("[");
+  let startIdx = -1;
+  let isObject = true;
+
+  if (firstBrace !== -1 && (firstBracket === -1 || firstBrace < firstBracket)) {
+    startIdx = firstBrace;
+    isObject = true;
+  } else if (firstBracket !== -1) {
+    startIdx = firstBracket;
+    isObject = false;
+  }
+
+  if (startIdx !== -1) {
+    const sub = str.slice(startIdx);
+    for (let endIdx = sub.length; endIdx > 0; endIdx--) {
+      const ch = sub[endIdx - 1];
+      if ((isObject && ch === "}") || (!isObject && ch === "]")) {
+        const candidate = sub.slice(0, endIdx);
+        try {
+          return JSON.parse(candidate);
+        } catch {}
+      }
+    }
+  }
+
+  return null;
+}
+
 function parseArgsFromContent(body: string, toolName: string): Record<string, any> {
   let cleaned = (body || "").trim();
   if (cleaned.startsWith("```")) {
     cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
   }
 
-  // 1. Direct JSON (object or array)
-  if ((cleaned.startsWith("{") && cleaned.endsWith("}")) || (cleaned.startsWith("[") && cleaned.endsWith("]"))) {
-    try {
-      const parsed = JSON.parse(cleaned);
-      if (typeof parsed === "object" && parsed !== null) {
-        return normalizeToolArguments(
-          toolName,
-          Array.isArray(parsed) ? { commands: parsed } : parsed
-        );
-      }
-    } catch {}
+  // 1. Direct JSON (object or array) or repaired JSON
+  const repaired = repairJson(cleaned);
+  if (repaired && typeof repaired === "object") {
+    return normalizeToolArguments(
+      toolName,
+      Array.isArray(repaired) ? { commands: repaired } : repaired
+    );
   }
 
   // 2. XML parameters <parameter name="..."> or <param name="...">
@@ -590,16 +799,10 @@ function parseArgsFromContent(body: string, toolName: string): Record<string, an
     hasParam = true;
     const pName = p[1].trim();
     const pVal = p[2].trim();
-    try {
-      if (
-        (pVal.startsWith("{") && pVal.endsWith("}")) ||
-        (pVal.startsWith("[") && pVal.endsWith("]"))
-      ) {
-        args[pName] = JSON.parse(pVal);
-      } else {
-        args[pName] = pVal;
-      }
-    } catch {
+    const parsedVal = repairJson(pVal);
+    if (parsedVal !== null && typeof parsedVal === "object") {
+      args[pName] = parsedVal;
+    } else {
       args[pName] = pVal;
     }
   }
@@ -617,16 +820,10 @@ function parseArgsFromContent(body: string, toolName: string): Record<string, an
     ) {
       hasTags = true;
       let val = dt[2].trim();
-      try {
-        if (
-          (val.startsWith("{") && val.endsWith("}")) ||
-          (val.startsWith("[") && val.endsWith("]"))
-        ) {
-          args[dt[1]] = JSON.parse(val);
-        } else {
-          args[dt[1]] = val;
-        }
-      } catch {
+      const parsedVal = repairJson(val);
+      if (parsedVal !== null && typeof parsedVal === "object") {
+        args[dt[1]] = parsedVal;
+      } else {
         args[dt[1]] = val;
       }
     }
@@ -634,12 +831,113 @@ function parseArgsFromContent(body: string, toolName: string): Record<string, an
   if (hasTags) return normalizeToolArguments(toolName, args);
 
   // 4. String fallback for single-string tools
-  if (toolName === "bash") return normalizeToolArguments(toolName, { command: cleaned });
+  if (toolName === "bash" || toolName === "powershell") return normalizeToolArguments(toolName, { command: cleaned });
   if (toolName === "read") return normalizeToolArguments(toolName, { path: cleaned });
   if (toolName === "ctx_execute") return normalizeToolArguments(toolName, { command: cleaned });
   if (toolName === "ctx_search") return normalizeToolArguments(toolName, { query: cleaned });
 
   return normalizeToolArguments(toolName, {});
+}
+
+function detectHeuristicToolCalls(
+  text: string,
+  availableTools: Set<string>
+): Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> {
+  if (!text || text.length < 5) return [];
+
+  const synthesized: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> = [];
+
+  // 1. File reading heuristic
+  // Matches: "อ่านไฟล์ src/router.ts", "ดูไฟล์ components/App.tsx", "check file src/index.ts", "read file /foo/bar.json"
+  const fileReadRegex =
+    /(?:จะ|ขอ)?(?:อ่านไฟล์|ดูไฟล์|ตรวจสอบไฟล์|เปิดไฟล์|read(?:\s+the)?\s+file|inspect(?:\s+the)?\s+file|check(?:\s+the)?\s+file|cat\s+file)\s*[:`'"\s]*([a-zA-Z0-9_./\\-]+\.(?:tsx?|jsx?|json|md|php|py|go|rs|html?|s?css|ya?ml|sh|env|toml|sql)\b)[`'"\s]*/i;
+  const fileMatch = fileReadRegex.exec(text);
+
+  if (fileMatch && fileMatch[1]) {
+    const filePath = fileMatch[1].trim();
+    if (availableTools.has("read")) {
+      synthesized.push({
+        id: "call_heur_" + Math.random().toString(36).substring(2, 9),
+        type: "function",
+        function: {
+          name: "read",
+          arguments: JSON.stringify({ path: filePath }),
+        },
+      });
+    } else if (availableTools.has("ctx_batch_execute")) {
+      synthesized.push({
+        id: "call_heur_" + Math.random().toString(36).substring(2, 9),
+        type: "function",
+        function: {
+          name: "ctx_batch_execute",
+          arguments: JSON.stringify({
+            commands: [{ command: `cat ${filePath}`, label: `read ${filePath}` }],
+          }),
+        },
+      });
+    } else if (availableTools.has("bash")) {
+      synthesized.push({
+        id: "call_heur_" + Math.random().toString(36).substring(2, 9),
+        type: "function",
+        function: {
+          name: "bash",
+          arguments: JSON.stringify({ command: `cat ${filePath}` }),
+        },
+      });
+    } else if (availableTools.has("powershell")) {
+      synthesized.push({
+        id: "call_heur_" + Math.random().toString(36).substring(2, 9),
+        type: "function",
+        function: {
+          name: "powershell",
+          arguments: JSON.stringify({ command: `Get-Content ${filePath}` }),
+        },
+      });
+    }
+  }
+
+  // 2. Command execution heuristic
+  // Matches: "รันคำสั่ง `npm test`", "run command `git status`", "execute `ls -la`"
+  if (synthesized.length === 0) {
+    const cmdRegex =
+      /(?:จะ|ขอ)?(?:รันคำสั่ง|รันคอมมานด์|สั่งรัน|run(?:\s+the)?\s+command|execute(?:\s+the)?\s+command)\s*[:\s]*`([^`\n\r]+)`/i;
+    const cmdMatch = cmdRegex.exec(text);
+    if (cmdMatch && cmdMatch[1]) {
+      const command = cmdMatch[1].trim();
+      if (availableTools.has("bash")) {
+        synthesized.push({
+          id: "call_heur_" + Math.random().toString(36).substring(2, 9),
+          type: "function",
+          function: {
+            name: "bash",
+            arguments: JSON.stringify({ command }),
+          },
+        });
+      } else if (availableTools.has("powershell")) {
+        synthesized.push({
+          id: "call_heur_" + Math.random().toString(36).substring(2, 9),
+          type: "function",
+          function: {
+            name: "powershell",
+            arguments: JSON.stringify({ command }),
+          },
+        });
+      } else if (availableTools.has("ctx_batch_execute")) {
+        synthesized.push({
+          id: "call_heur_" + Math.random().toString(36).substring(2, 9),
+          type: "function",
+          function: {
+            name: "ctx_batch_execute",
+            arguments: JSON.stringify({
+              commands: [{ command, label: command.slice(0, 30) }],
+            }),
+          },
+        });
+      }
+    }
+  }
+
+  return synthesized;
 }
 
 function extractToolCallsFromText(
@@ -743,12 +1041,13 @@ function extractToolCallsFromText(
       if (!foundDirectTag) {
         const cmdMatch = /<command>([\s\S]*?)<\/command>/i.exec(inner);
         if (cmdMatch) {
+          const shellTool = tools.has("powershell") && !tools.has("bash") ? "powershell" : "bash";
           toolCalls.push({
             id: "call_" + Math.random().toString(36).substring(2, 11),
             type: "function",
             function: {
-              name: "bash",
-              arguments: JSON.stringify(normalizeToolArguments("bash", { command: cmdMatch[1].trim() })),
+              name: shellTool,
+              arguments: JSON.stringify(normalizeToolArguments(shellTool, { command: cmdMatch[1].trim() })),
             },
           });
         } else {
@@ -840,6 +1139,17 @@ function extractToolCallsFromText(
     if (!isDup) uniqueToolCalls.push(tc);
   }
 
+  // Safety Heuristic Intent Fallback: if model announced intent without XML tags
+  if (uniqueToolCalls.length === 0) {
+    const heuristics = detectHeuristicToolCalls(rawText, tools);
+    if (heuristics.length > 0) {
+      console.log(
+        `[Freebuff Tool Fallback] Model announced intent without XML tags; synthesized tool call: ${heuristics[0].function.name}`
+      );
+      return { cleanText: rawText.trim(), toolCalls: heuristics };
+    }
+  }
+
   const cleanText = earliestToolIdx !== -1 ? rawText.slice(0, earliestToolIdx).trim() : rawText.trim();
   return { cleanText, toolCalls: uniqueToolCalls };
 }
@@ -850,6 +1160,10 @@ class DSMLStreamTransformer {
   private carry = "";
   private toolStartRegex: RegExp;
   private hasNativeToolCalls = false;
+  private emittedToolCallCount = 0;
+  private fullTextBuffer = "";
+
+  private totalReasoningLength = 0;
 
   constructor(
     private res: http.ServerResponse,
@@ -860,8 +1174,17 @@ class DSMLStreamTransformer {
     this.toolStartRegex = buildToolStartRegex(this.availableToolNames);
   }
 
+  getMetrics() {
+    return {
+      completionChars: this.fullTextBuffer.length + this.dsmlBuffer.length,
+      reasoningChars: this.totalReasoningLength,
+      toolCallsCount: this.emittedToolCallCount,
+    };
+  }
+
   feedReasoning(reasoning: string) {
     if (!reasoning) return;
+    this.totalReasoningLength += reasoning.length;
     const chunk = {
       id: this.id,
       object: "chat.completion.chunk",
@@ -894,6 +1217,7 @@ class DSMLStreamTransformer {
   feedText(text: string) {
     if (this.inDSML) {
       this.dsmlBuffer += text;
+      this.checkAndEmitEarlyToolCalls();
       return;
     }
 
@@ -908,6 +1232,7 @@ class DSMLStreamTransformer {
       }
       this.dsmlBuffer = combined.slice(toolMatch.index);
       this.carry = "";
+      this.checkAndEmitEarlyToolCalls();
     } else {
       const partialIdx = combined.lastIndexOf("<");
       if (
@@ -929,6 +1254,7 @@ class DSMLStreamTransformer {
   }
 
   private emitContentDelta(content: string) {
+    this.fullTextBuffer += content;
     const chunk = {
       id: this.id,
       object: "chat.completion.chunk",
@@ -937,6 +1263,46 @@ class DSMLStreamTransformer {
       choices: [{ index: 0, delta: { content }, finish_reason: null }],
     };
     this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+  }
+
+  private checkAndEmitEarlyToolCalls() {
+    // Only check if closing tag is found in dsmlBuffer
+    if (!/<\/(?:[a-zA-Z0-9_.-]+|[|｜]+DSML[|｜]+[^>]*)>/i.test(this.dsmlBuffer)) {
+      return;
+    }
+
+    const { toolCalls } = extractToolCallsFromText(this.dsmlBuffer, this.availableToolNames);
+    if (toolCalls.length > this.emittedToolCallCount) {
+      const newCalls = toolCalls.slice(this.emittedToolCallCount);
+      for (let i = 0; i < newCalls.length; i++) {
+        const globalIdx = this.emittedToolCallCount + i;
+        const tc = newCalls[i];
+        const chunk = {
+          id: this.id,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: this.model,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: globalIdx,
+                    id: tc.id,
+                    type: "function" as const,
+                    function: tc.function,
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        };
+        this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      }
+      this.emittedToolCallCount = toolCalls.length;
+    }
   }
 
   finish() {
@@ -964,21 +1330,39 @@ class DSMLStreamTransformer {
 
     if (this.inDSML || this.toolStartRegex.test(this.dsmlBuffer)) {
       const { toolCalls } = extractToolCallsFromText(this.dsmlBuffer, this.availableToolNames);
-      if (toolCalls.length > 0) {
-        const formattedToolCalls = toolCalls.map((tc, idx) => ({
-          index: idx,
-          id: tc.id,
-          type: "function" as const,
-          function: tc.function,
-        }));
-        const chunk = {
+      if (toolCalls.length > this.emittedToolCallCount) {
+        const remaining = toolCalls.slice(this.emittedToolCallCount);
+        for (let i = 0; i < remaining.length; i++) {
+          const globalIdx = this.emittedToolCallCount + i;
+          const tc = remaining[i];
+          const chunk = {
+            id: this.id,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: this.model,
+            choices: [
+              {
+                index: globalIdx,
+                id: tc.id,
+                type: "function" as const,
+                function: tc.function,
+              },
+            ],
+          };
+          this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        }
+        this.emittedToolCallCount = toolCalls.length;
+      }
+
+      if (this.emittedToolCallCount > 0) {
+        const endChunk = {
           id: this.id,
           object: "chat.completion.chunk",
           created: Math.floor(Date.now() / 1000),
           model: this.model,
-          choices: [{ index: 0, delta: { tool_calls: formattedToolCalls }, finish_reason: "tool_calls" }],
+          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
         };
-        this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        this.res.write(`data: ${JSON.stringify(endChunk)}\n\n`);
         this.res.write("data: [DONE]\n\n");
         return;
       } else {
@@ -986,6 +1370,50 @@ class DSMLStreamTransformer {
         if (this.dsmlBuffer.length > 0) {
           this.emitContentDelta(this.dsmlBuffer);
         }
+      }
+    }
+
+    // Heuristic Intent Fallback for streaming when model outputted intent without XML tags
+    if (this.emittedToolCallCount === 0 && this.availableToolNames && this.availableToolNames.size > 0) {
+      const heuristics = detectHeuristicToolCalls(this.fullTextBuffer, this.availableToolNames);
+      if (heuristics.length > 0) {
+        console.log(
+          `[Freebuff Tool Fallback] Streamed text contained tool intent without XML tags; synthesized tool call: ${heuristics[0].function.name}`
+        );
+        const tc = heuristics[0];
+        const chunk = {
+          id: this.id,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: this.model,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: tc.id,
+                    type: "function" as const,
+                    function: tc.function,
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        };
+        this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        const endChunk = {
+          id: this.id,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: this.model,
+          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+        };
+        this.res.write(`data: ${JSON.stringify(endChunk)}\n\n`);
+        this.res.write("data: [DONE]\n\n");
+        return;
       }
     }
 
@@ -1067,6 +1495,299 @@ function loadSessionDisk(token: string): SessionCache | null {
     }
   } catch {}
   return null;
+}
+
+interface FreebuffSettings {
+  autoSession: boolean;
+  lastUsedModel?: string;
+}
+
+let inMemorySettings: FreebuffSettings | null = null;
+let userExplicitlyStopped = false;
+let lastAutoRentAttemptTime = 0;
+
+function getSettingsDiskPath(): string {
+  return path.join(os.homedir(), ".config", "manicode", "freebuff-settings.json");
+}
+
+function loadFreebuffSettings(): FreebuffSettings {
+  if (inMemorySettings) return inMemorySettings;
+  try {
+    const p = getSettingsDiskPath();
+    if (fs.existsSync(p)) {
+      const data = JSON.parse(fs.readFileSync(p, "utf8"));
+      inMemorySettings = {
+        autoSession: Boolean(data.autoSession),
+        lastUsedModel: typeof data.lastUsedModel === "string" ? data.lastUsedModel : undefined,
+      };
+      return inMemorySettings;
+    }
+  } catch {}
+  inMemorySettings = { autoSession: false };
+  return inMemorySettings;
+}
+
+function saveFreebuffSettings(patch: Partial<FreebuffSettings>): FreebuffSettings {
+  const current = loadFreebuffSettings();
+  const updated: FreebuffSettings = { ...current, ...patch };
+  inMemorySettings = updated;
+  try {
+    const p = getSettingsDiskPath();
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, JSON.stringify(updated, null, 2), { mode: 0o600 });
+  } catch {}
+  return updated;
+}
+
+function isAutoSessionEnabled(): boolean {
+  return loadFreebuffSettings().autoSession;
+}
+
+function setAutoSessionEnabled(enabled: boolean): void {
+  saveFreebuffSettings({ autoSession: enabled });
+}
+
+function getLastUsedModel(): string | null {
+  return loadFreebuffSettings().lastUsedModel || null;
+}
+
+function setLastUsedModel(model: string): void {
+  if (!model || typeof model !== "string") return;
+  const normalized = MODEL_ALIASES[model] || model;
+  saveFreebuffSettings({ lastUsedModel: normalized });
+}
+
+function isUserExplicitlyStopped(): boolean {
+  return userExplicitlyStopped;
+}
+
+function setUserExplicitlyStopped(val: boolean): void {
+  userExplicitlyStopped = val;
+}
+
+// ==========================================
+// Token Usage & Cost Savings Analytics Engine
+// ==========================================
+
+interface ModelStats {
+  requests: number;
+  promptTokens: number;
+  completionTokens: number;
+  reasoningTokens: number;
+  toolCalls: number;
+  savedUsd: number;
+}
+
+interface FreebuffStats {
+  totalRequests: number;
+  totalPromptTokens: number;
+  totalCompletionTokens: number;
+  totalReasoningTokens: number;
+  totalToolCalls: number;
+  totalSavedUsd: number;
+  firstUsedAt: number;
+  lastUsedAt: number;
+  byModel: Record<string, ModelStats>;
+}
+
+const MODEL_PRICING: Record<string, { prompt: number; completion: number }> = {
+  // Anthropic Claude
+  "anthropic/claude-3-7-sonnet": { prompt: 3.0, completion: 15.0 },
+  "anthropic/claude-3.7-sonnet": { prompt: 3.0, completion: 15.0 },
+  "anthropic/claude-3-5-sonnet": { prompt: 3.0, completion: 15.0 },
+  "anthropic/claude-3.5-sonnet": { prompt: 3.0, completion: 15.0 },
+  "anthropic/claude-3-5-haiku": { prompt: 0.8, completion: 4.0 },
+  "anthropic/claude-3.5-haiku": { prompt: 0.8, completion: 4.0 },
+  "anthropic/claude-3-haiku": { prompt: 0.25, completion: 1.25 },
+  "anthropic/claude-3-opus": { prompt: 15.0, completion: 75.0 },
+  // OpenAI
+  "openai/gpt-4o": { prompt: 2.5, completion: 10.0 },
+  "openai/gpt-4o-mini": { prompt: 0.15, completion: 0.6 },
+  "openai/o3-mini": { prompt: 1.1, completion: 4.4 },
+  "openai/o1": { prompt: 15.0, completion: 60.0 },
+  "openai/o1-mini": { prompt: 1.1, completion: 4.4 },
+  // DeepSeek
+  "deepseek/deepseek-r1": { prompt: 0.55, completion: 2.19 },
+  "deepseek/deepseek-chat": { prompt: 0.14, completion: 0.28 },
+  "deepseek/deepseek-v4-flash-0731": { prompt: 0.14, completion: 0.28 },
+  // Google Gemini
+  "google/gemini-2.5-pro": { prompt: 1.25, completion: 5.0 },
+  "google/gemini-2.5-flash": { prompt: 0.15, completion: 0.6 },
+  "google/gemini-2.0-flash": { prompt: 0.1, completion: 0.4 },
+  "google/gemini-1.5-pro": { prompt: 1.25, completion: 5.0 },
+  "google/gemini-1.5-flash": { prompt: 0.075, completion: 0.3 },
+  // Qwen
+  "qwen/qwen-2.5-coder-32b": { prompt: 0.2, completion: 0.6 },
+  // Default fallback
+  default: { prompt: 1.5, completion: 6.0 },
+};
+
+function getStatsDiskPath(): string {
+  return path.join(os.homedir(), ".config", "manicode", "freebuff-stats.json");
+}
+
+let inMemoryStats: FreebuffStats | null = null;
+
+function createEmptyStats(): FreebuffStats {
+  return {
+    totalRequests: 0,
+    totalPromptTokens: 0,
+    totalCompletionTokens: 0,
+    totalReasoningTokens: 0,
+    totalToolCalls: 0,
+    totalSavedUsd: 0,
+    firstUsedAt: Date.now(),
+    lastUsedAt: Date.now(),
+    byModel: {},
+  };
+}
+
+function loadFreebuffStats(): FreebuffStats {
+  if (inMemoryStats) return inMemoryStats;
+  try {
+    const p = getStatsDiskPath();
+    if (fs.existsSync(p)) {
+      const data = JSON.parse(fs.readFileSync(p, "utf8"));
+      inMemoryStats = {
+        totalRequests: Number(data.totalRequests) || 0,
+        totalPromptTokens: Number(data.totalPromptTokens) || 0,
+        totalCompletionTokens: Number(data.totalCompletionTokens) || 0,
+        totalReasoningTokens: Number(data.totalReasoningTokens) || 0,
+        totalToolCalls: Number(data.totalToolCalls) || 0,
+        totalSavedUsd: Number(data.totalSavedUsd) || 0,
+        firstUsedAt: Number(data.firstUsedAt) || Date.now(),
+        lastUsedAt: Number(data.lastUsedAt) || Date.now(),
+        byModel: typeof data.byModel === "object" && data.byModel !== null ? data.byModel : {},
+      };
+      return inMemoryStats;
+    }
+  } catch {}
+  inMemoryStats = createEmptyStats();
+  return inMemoryStats;
+}
+
+function saveFreebuffStats(stats: FreebuffStats): void {
+  inMemoryStats = stats;
+  try {
+    const p = getStatsDiskPath();
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, JSON.stringify(stats, null, 2), { mode: 0o600 });
+  } catch {}
+}
+
+function resetFreebuffStats(): void {
+  inMemoryStats = createEmptyStats();
+  saveFreebuffStats(inMemoryStats);
+}
+
+function estimatePromptTokens(messages: any[]): number {
+  if (!Array.isArray(messages)) return 0;
+  let totalChars = 0;
+  for (const m of messages) {
+    if (typeof m.content === "string") totalChars += m.content.length;
+    else if (Array.isArray(m.content)) {
+      for (const part of m.content) {
+        if (typeof part?.text === "string") totalChars += part.text.length;
+      }
+    }
+  }
+  return Math.max(1, Math.round(totalChars / 3.8) + messages.length * 4);
+}
+
+function recordRequestUsage(
+  model: string,
+  promptTokens: number,
+  completionTokens: number,
+  reasoningTokens: number,
+  toolCalls: number
+): void {
+  const stats = loadFreebuffStats();
+  const normalizedModel = MODEL_ALIASES[model] || model;
+  const pricing = MODEL_PRICING[normalizedModel] || MODEL_PRICING[model] || MODEL_PRICING.default;
+
+  const promptCost = (promptTokens / 1_000_000) * pricing.prompt;
+  const completionCost = ((completionTokens + reasoningTokens) / 1_000_000) * pricing.completion;
+  const savedUsd = promptCost + completionCost;
+
+  stats.totalRequests += 1;
+  stats.totalPromptTokens += promptTokens;
+  stats.totalCompletionTokens += completionTokens;
+  stats.totalReasoningTokens += reasoningTokens;
+  stats.totalToolCalls += toolCalls;
+  stats.totalSavedUsd += savedUsd;
+  stats.lastUsedAt = Date.now();
+
+  if (!stats.byModel[normalizedModel]) {
+    stats.byModel[normalizedModel] = {
+      requests: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      reasoningTokens: 0,
+      toolCalls: 0,
+      savedUsd: 0,
+    };
+  }
+
+  const mStats = stats.byModel[normalizedModel];
+  mStats.requests += 1;
+  mStats.promptTokens += promptTokens;
+  mStats.completionTokens += completionTokens;
+  mStats.reasoningTokens += reasoningTokens;
+  mStats.toolCalls += toolCalls;
+  mStats.savedUsd += savedUsd;
+
+  saveFreebuffStats(stats);
+}
+
+function formatTokenCount(n: number): string {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + "M";
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + "k";
+  return String(n);
+}
+
+function formatStatsSummary(): string {
+  const stats = loadFreebuffStats();
+  const usd = stats.totalSavedUsd;
+  const thb = (usd * 34.0).toFixed(1);
+  const totalTokens = stats.totalPromptTokens + stats.totalCompletionTokens + stats.totalReasoningTokens;
+
+  const lines: string[] = [];
+  lines.push("╔══════════════════════════════════════════════════════════════════════╗");
+  lines.push("║              📊 Freebuff Token & Cost Savings Analytics              ║");
+  lines.push("╚══════════════════════════════════════════════════════════════════════╝");
+  lines.push(` 💰 Estimated API Cost Saved : $${usd.toFixed(2)} USD (~฿${thb} THB)`);
+  lines.push(` ⚡ Total Requests Served    : ${stats.totalRequests} requests`);
+  lines.push(` 🔤 Total Tokens Processed   : ${formatTokenCount(totalTokens)} (${totalTokens.toLocaleString()} tokens)`);
+  lines.push(`    ├─ Prompt / Input Tokens : ${formatTokenCount(stats.totalPromptTokens)} (${stats.totalPromptTokens.toLocaleString()})`);
+  lines.push(`    ├─ Completion / Output   : ${formatTokenCount(stats.totalCompletionTokens)} (${stats.totalCompletionTokens.toLocaleString()})`);
+  if (stats.totalReasoningTokens > 0) {
+    lines.push(`    └─ Reasoning / Thinking  : ${formatTokenCount(stats.totalReasoningTokens)} (${stats.totalReasoningTokens.toLocaleString()})`);
+  }
+  lines.push(` 🛠️  Tool Calls Synthesized   : ${stats.totalToolCalls} calls`);
+
+  const models = Object.keys(stats.byModel).sort(
+    (a, b) => stats.byModel[b].savedUsd - stats.byModel[a].savedUsd
+  );
+
+  if (models.length > 0) {
+    lines.push("");
+    lines.push(" 📈 Usage Breakdown by Model:");
+    for (const m of models) {
+      const ms = stats.byModel[m];
+      const mTotal = ms.promptTokens + ms.completionTokens + ms.reasoningTokens;
+      const mName = prettyModelName(m);
+      lines.push(
+        `  • ${mName.padEnd(20)} : ${ms.requests} reqs | ${formatTokenCount(mTotal)} tokens | Saved $${ms.savedUsd.toFixed(2)}`
+      );
+    }
+  }
+
+  const startDate = new Date(stats.firstUsedAt).toLocaleString();
+  lines.push("");
+  lines.push(` Active Tracking since: ${startDate}`);
+  lines.push(" Run '/freebuff stats reset' to clear recorded metrics.");
+
+  return lines.join("\n");
 }
 
 class CodebuffClient {
@@ -1151,6 +1872,7 @@ class CodebuffClient {
     } catch {}
     this.currentSession = null;
     saveSessionDisk(this.token, null);
+    setUserExplicitlyStopped(true);
   }
 
   getActiveSession(targetModel?: string): SessionCache | null {
@@ -1179,6 +1901,8 @@ class CodebuffClient {
     // Check if session for requested model is already active
     const active = this.getActiveSession(targetModel);
     if (active && active.instanceId) {
+      setLastUsedModel(active.model);
+      setUserExplicitlyStopped(false);
       const remainingMins = Math.ceil((active.expiresAt - now) / 60000);
       return {
         ok: true,
@@ -1236,6 +1960,8 @@ class CodebuffClient {
       countryBlockReason: data.countryBlockReason || undefined,
     };
     saveSessionDisk(this.token, this.currentSession);
+    setLastUsedModel(this.currentSession.model);
+    setUserExplicitlyStopped(false);
 
     const mins = Math.ceil((expiresAt - now) / 60000);
     return {
@@ -1249,6 +1975,7 @@ class CodebuffClient {
     const targetModel = MODEL_ALIASES[model] || model;
     const active = this.getActiveSession(targetModel);
     if (active && active.instanceId) {
+      setLastUsedModel(active.model);
       return active.instanceId;
     }
 
@@ -1257,6 +1984,21 @@ class CodebuffClient {
       const mins = Math.ceil((anyActive.expiresAt - Date.now()) / 60000);
       throw new Error(
         `Active session is locked to ${prettyModelName(anyActive.model)} (${mins}m remaining). Switch to ${anyActive.model} in pi (/model) or run '/freebuff' to start a session for ${prettyModelName(targetModel)}.`
+      );
+    }
+
+    if (isAutoSessionEnabled()) {
+      setUserExplicitlyStopped(false);
+      console.log(
+        `[Freebuff Auto-Session] No active session for ${prettyModelName(targetModel)}. Auto-renting 1-hour session...`
+      );
+      const res = await this.startSession(targetModel);
+      if (res.ok && res.instanceId) {
+        setLastUsedModel(targetModel);
+        return res.instanceId;
+      }
+      throw new Error(
+        `Auto-Session failed to rent ${prettyModelName(targetModel)}: ${res.message}`
       );
     }
 
@@ -1906,10 +2648,28 @@ export default async function (pi: ExtensionAPI) {
           const upstreamModel = MODEL_ALIASES[requestedModel] || requestedModel;
           const agentId = AGENT_MAP[requestedModel] || AGENT_MAP[upstreamModel] || "base3-free-deepseek-flash";
 
+          // Translate and enforce tool_choice directive
+          let toolChoiceDirective = "";
+          if (payload.tool_choice) {
+            if (payload.tool_choice === "required") {
+              toolChoiceDirective = `\n# CRITICAL MANDATE: TOOL CALL REQUIRED\nYou MUST invoke at least one tool in this turn using the tool calling XML format. It is strictly forbidden to answer with text only without calling a tool.`;
+            } else if (payload.tool_choice === "none") {
+              toolChoiceDirective = `\n# CRITICAL MANDATE: NO TOOLS\nYou MUST NOT call any tools in this turn. Respond with plain text only. Do NOT output any XML tool tags.`;
+            } else if (typeof payload.tool_choice === "object" && payload.tool_choice.function?.name) {
+              const forcedTool = payload.tool_choice.function.name;
+              toolChoiceDirective = `\n# CRITICAL MANDATE: FORCED TOOL EXECUTION\nYou MUST invoke the specific tool \`${forcedTool}\` in this turn using its XML format. Do NOT skip calling this tool.`;
+            } else if (typeof payload.tool_choice === "string" && payload.tool_choice !== "auto") {
+              toolChoiceDirective = `\n# CRITICAL MANDATE: FORCED TOOL EXECUTION\nYou MUST invoke the tool \`${payload.tool_choice}\` in this turn.`;
+            }
+          }
+
           // Inject Buffy system marker and tool documentation
           const marker = getBuffyMarker(upstreamModel);
           const toolsPrompt = formatToolsForSystemPrompt(payload.tools);
-          const fullMarker = toolsPrompt ? `${marker}\n\n${toolsPrompt}` : marker;
+          let fullMarker = toolsPrompt ? `${marker}\n\n${toolsPrompt}` : marker;
+          if (toolChoiceDirective) {
+            fullMarker = `${fullMarker}\n\n${toolChoiceDirective}`;
+          }
           let messages = Array.isArray(payload.messages) ? payload.messages : [];
           if (messages.length > 0 && messages[0].role === "system") {
             messages[0].content = `${fullMarker}\n\n${messages[0].content}`;
@@ -2076,6 +2836,8 @@ export default async function (pi: ExtensionAPI) {
             return;
           }
 
+          const estimatedPromptTokens = estimatePromptTokens(payload.messages);
+
           if (!isStream) {
             const data = (await upstreamRes.json()) as any;
             const choice = data.choices?.[0];
@@ -2097,6 +2859,26 @@ export default async function (pi: ExtensionAPI) {
               await activeRunInfo.client.finishRun(activeRunInfo.runId);
               activeRunInfo = null;
             }
+
+            // Record Token & Cost Analytics for non-streaming request
+            try {
+              const promptTokens = data.usage?.prompt_tokens ?? estimatedPromptTokens;
+              const completionTokens =
+                data.usage?.completion_tokens ??
+                Math.max(1, Math.round((choice?.message?.content?.length || 0) / 3.8));
+              const reasoningTokens =
+                data.usage?.completion_tokens_details?.reasoning_tokens ?? 0;
+              const toolCallsCount = Array.isArray(choice?.message?.tool_calls)
+                ? choice.message.tool_calls.length
+                : 0;
+              recordRequestUsage(
+                requestedModel,
+                promptTokens,
+                completionTokens,
+                reasoningTokens,
+                toolCallsCount
+              );
+            } catch {}
             return;
           }
 
@@ -2140,6 +2922,7 @@ export default async function (pi: ExtensionAPI) {
             availableToolNames
           );
 
+          let upstreamUsage: any = null;
           const decoder = new TextDecoder();
           let sseBuffer = "";
 
@@ -2160,6 +2943,9 @@ export default async function (pi: ExtensionAPI) {
 
                   try {
                     const parsed = JSON.parse(dataStr);
+                    if (parsed.usage) {
+                      upstreamUsage = parsed.usage;
+                    }
                     const delta = parsed.choices?.[0]?.delta;
                     if (delta?.reasoning_content) {
                       transformer.feedReasoning(delta.reasoning_content);
@@ -2177,6 +2963,26 @@ export default async function (pi: ExtensionAPI) {
               transformer.finish();
               res.end();
               await cleanup();
+
+              // Record Token & Cost Analytics for streaming request
+              try {
+                const metrics = transformer.getMetrics();
+                const promptTokens = upstreamUsage?.prompt_tokens ?? estimatedPromptTokens;
+                const completionTokens =
+                  upstreamUsage?.completion_tokens ??
+                  Math.max(1, Math.round(metrics.completionChars / 3.8));
+                const reasoningTokens =
+                  upstreamUsage?.completion_tokens_details?.reasoning_tokens ??
+                  Math.round(metrics.reasoningChars / 3.8);
+                const toolCallsCount = metrics.toolCallsCount;
+                recordRequestUsage(
+                  requestedModel,
+                  promptTokens,
+                  completionTokens,
+                  reasoningTokens,
+                  toolCallsCount
+                );
+              } catch {}
             }
           };
 
@@ -2210,22 +3016,73 @@ export default async function (pi: ExtensionAPI) {
   const address = server.address() as { port: number };
   const proxyBaseUrl = `http://127.0.0.1:${address.port}/v1`;
 
+async function checkAndAutoRenewSession(pool: TokenPool): Promise<void> {
+  if (!isAutoSessionEnabled()) return;
+  if (isUserExplicitlyStopped()) return;
+
+  const entry = pool.peekActive();
+  if (!entry) return;
+
+  const client = entry.client;
+  const activeSession = client.getActiveSession();
+  if (activeSession && activeSession.instanceId) {
+    if (activeSession.model) {
+      setLastUsedModel(activeSession.model);
+    }
+    return;
+  }
+
+  // Session has expired or is null!
+  const now = Date.now();
+  if (now - lastAutoRentAttemptTime < 60_000) {
+    return; // Cooldown 60s
+  }
+
+  const modelToRent = getLastUsedModel() || pool.getLastRequestedModel();
+  if (!modelToRent) return;
+
+  lastAutoRentAttemptTime = now;
+  console.log(
+    `[Freebuff Auto-Session] Active session expired. Automatically renewing 1-hour session for ${prettyModelName(modelToRent)}...`
+  );
+
+  try {
+    const res = await client.startSession(modelToRent);
+    if (res.ok) {
+      setLastUsedModel(modelToRent);
+      console.log(
+        `[Freebuff Auto-Session] Successfully renewed 1-hour session for ${prettyModelName(modelToRent)}!`
+      );
+    } else {
+      console.warn(
+        `[Freebuff Auto-Session] Auto-renewal failed: ${res.message}`
+      );
+    }
+  } catch (err: any) {
+    console.warn(`[Freebuff Auto-Session] Error during auto-renewal: ${err?.message || err}`);
+  }
+}
+
   // Keep-alive heartbeat: the official desktop client pings its active
   // session every ~45s (GET /freebuff/session + x-freebuff-heartbeat) to
-  // prevent mid-conversation expiry. Only the active account's session is
-  // pinged, and only if one exists — idle sessions with no traffic create
-  // no heartbeat traffic at all.
+  // prevent mid-conversation expiry. Also runs auto-session renewal if enabled.
   const HEARTBEAT_INTERVAL_MS = 45_000;
   const heartbeatTimer = setInterval(async () => {
     try {
       const entry = pool.peekActive();
       await entry?.client.heartbeat();
+      await checkAndAutoRenewSession(pool);
     } catch {}
   }, HEARTBEAT_INTERVAL_MS);
   // Don't keep the process alive just for the heartbeat (Node only)
   if (typeof (heartbeatTimer as any)?.unref === "function") {
     (heartbeatTimer as any).unref();
   }
+
+  // Initial check shortly after startup if autoSession is enabled
+  setTimeout(() => {
+    checkAndAutoRenewSession(pool).catch(() => {});
+  }, 4000);
 
   // Stop heartbeat and close server on shutdown (keep cloud sessions intact for their full hour!)
   pi.on("session_shutdown", () => {
@@ -2317,6 +3174,7 @@ export default async function (pi: ExtensionAPI) {
       // 2. Subcommand: /freebuff stop / end / reset
       if (sub === "stop" || sub === "end" || sub === "reset") {
         if (activeClient) {
+          setUserExplicitlyStopped(true);
           await activeClient.deleteSession();
           ctx.ui.notify("Active cloud session released successfully.", "info");
         } else {
@@ -2325,7 +3183,36 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      // 3. Subcommand: /freebuff add <token>
+      // 3. Subcommand: /freebuff auto-session [on/off]
+      if (sub === "auto-session" || sub === "autosession" || sub === "auto") {
+        const action = parts[1]?.toLowerCase();
+        let newState: boolean;
+        if (["on", "enable", "true", "1"].includes(action)) {
+          newState = true;
+        } else if (["off", "disable", "false", "0"].includes(action)) {
+          newState = false;
+        } else {
+          newState = !isAutoSessionEnabled();
+        }
+
+        setAutoSessionEnabled(newState);
+        if (newState) {
+          setUserExplicitlyStopped(false);
+          const lastMdl = getLastUsedModel() || activeClient?.getActiveSession()?.model || "current model";
+          ctx.ui.notify(
+            `Auto-Sessions ENABLED: Freebuff will automatically re-rent a 1-hour session for ${prettyModelName(lastMdl)} when the session expires.`,
+            "info"
+          );
+        } else {
+          ctx.ui.notify(
+            "Auto-Sessions DISABLED: Session rental is now manual via /freebuff.",
+            "info"
+          );
+        }
+        return;
+      }
+
+      // 4. Subcommand: /freebuff add <token>
       if (sub === "add") {
         let tokenToAdd = parts.slice(1).join(" ").trim();
         if (!tokenToAdd && ctx.hasUI) {
@@ -2349,7 +3236,7 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      // 4. Subcommand: /freebuff login
+      // 5. Subcommand: /freebuff login
       if (sub === "login") {
         if (ctx.hasUI) {
           ctx.ui.notify(
@@ -2379,7 +3266,7 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      // 5. Subcommand: /freebuff rotate
+      // 6. Subcommand: /freebuff rotate
       if (sub === "rotate") {
         const rotated = pool.rotateNext(true);
         const newActive = pool.getPoolStatus().find((p) => p.isActive);
@@ -2392,19 +3279,36 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      // 6. Subcommand: /freebuff help
+      // 7. Subcommand: /freebuff stats [reset]
+      if (sub === "stats" || sub === "usage") {
+        const action = parts[1]?.toLowerCase();
+        if (action === "reset" || action === "clear") {
+          resetFreebuffStats();
+          ctx.ui.notify("Freebuff token metrics and cost savings have been reset.", "info");
+          return;
+        }
+        ctx.ui.notify(formatStatsSummary(), "info");
+        return;
+      }
+
+      // 8. Subcommand: /freebuff help
       if (sub === "help") {
         const helpText = [
           "Freebuff Commands Guide:",
-          "/freebuff             - Open interactive dashboard & session manager",
-          "/freebuff start       - Open model picker to rent a 1-hour session",
-          "/freebuff start <mdl> - Rent 1-hour session (e.g. glm, 0731, solar)",
-          "/freebuff stop        - Release current cloud session",
-          "/freebuff status      - View accounts, Freebucks balance & countdown",
-          "/freebuff login       - Open login link & prompt to paste token",
-          "/freebuff add <token> - Add an auth token to the account pool",
-          "/freebuff rotate      - Switch to next standby account",
-          "/model                - Open pi native model selector",
+          "/freebuff                 - Open interactive dashboard & session manager",
+          "/freebuff start           - Open model picker to rent a 1-hour session",
+          "/freebuff start <mdl>     - Rent 1-hour session (e.g. glm, 0731, solar)",
+          "/freebuff auto-session    - Toggle auto-renewal of expired sessions",
+          "/freebuff auto-session on - Enable auto-renewal using last-used model",
+          "/freebuff auto-session off- Disable auto-renewal (manual rental only)",
+          "/freebuff stop            - Release current cloud session",
+          "/freebuff stats           - View total tokens processed & estimated USD/THB savings",
+          "/freebuff stats reset     - Reset recorded token and cost statistics",
+          "/freebuff status          - View accounts, Freebucks balance & countdown",
+          "/freebuff login           - Open login link & prompt to paste token",
+          "/freebuff add <token>     - Add an auth token to the account pool",
+          "/freebuff rotate          - Switch to next standby account",
+          "/model                    - Open pi native model selector",
         ].join("\n");
         ctx.ui.notify(helpText, "info");
         return;
@@ -2435,10 +3339,14 @@ export default async function (pi: ExtensionAPI) {
           const sessionLine = a.activeModel
             ? `${a.activeModel} (${a.remainingMins}m left)`
             : "None (Idle)";
+          const autoLine = isAutoSessionEnabled()
+            ? `Auto-Session: ENABLED (renews ${prettyModelName(getLastUsedModel() || a.activeModel || "last model")})`
+            : "Auto-Session: DISABLED (manual)";
           const lines = [
             `${tag}  ${a.name}  (${a.maskedToken})`,
             `           Freebucks : ${coins} coins  |  ${daily}`,
             `           Session   : ${sessionLine}`,
+            `           Policy    : ${autoLine}`,
             `           Traffic   : ${a.requests} request(s) served`,
           ];
           if (a.countryBlockReason) {
@@ -2452,9 +3360,14 @@ export default async function (pi: ExtensionAPI) {
         ? `  Active: ${prettyModelName(activeAcc!.activeModel!)}  |  ${remainingMins}m remaining`
         : "  No Active Session  |  Select an action below:";
 
+      const stats = loadFreebuffStats();
+      const totalTokens = stats.totalPromptTokens + stats.totalCompletionTokens + stats.totalReasoningTokens;
+      const statsSummaryLine = `  💰 Savings: $${stats.totalSavedUsd.toFixed(2)} USD (~฿${(stats.totalSavedUsd * 34).toFixed(0)}) | ⚡ ${formatTokenCount(totalTokens)} Tokens (${stats.totalRequests} reqs)`;
+
       const dashboardTitle = [
         divider,
         "  FREEBUFF ACCOUNT DASHBOARD",
+        statsSummaryLine,
         divider,
         accountCards,
         divider,
@@ -2475,6 +3388,11 @@ export default async function (pi: ExtensionAPI) {
         if (accounts.length > 1) {
           menuOptions.push("[Rotate] Switch to Next Standby Account");
         }
+        const autoLabel = isAutoSessionEnabled()
+          ? "[Auto-Session] Toggle OFF (Currently: ENABLED)"
+          : "[Auto-Session] Toggle ON (Currently: DISABLED)";
+        menuOptions.push(autoLabel);
+        menuOptions.push("[Stats] View Token Usage & Cost Savings");
         menuOptions.push("[Status] Show Dashboard in Notification");
         menuOptions.push("[Token] Add Auth Token / Login");
         menuOptions.push("Close");
@@ -2512,8 +3430,25 @@ export default async function (pi: ExtensionAPI) {
           }
         } else if (choice && choice.startsWith("[End]")) {
           if (activeClient) {
+            setUserExplicitlyStopped(true);
             await activeClient.deleteSession();
             ctx.ui.notify("Active session released successfully.", "info");
+          }
+        } else if (choice && choice.startsWith("[Auto-Session]")) {
+          const next = !isAutoSessionEnabled();
+          setAutoSessionEnabled(next);
+          if (next) {
+            setUserExplicitlyStopped(false);
+            const lastMdl = getLastUsedModel() || activeAcc?.activeModel || "current model";
+            ctx.ui.notify(
+              `Auto-Sessions ENABLED: Freebuff will automatically re-rent a 1-hour session for ${prettyModelName(lastMdl)} when expired.`,
+              "info"
+            );
+          } else {
+            ctx.ui.notify(
+              "Auto-Sessions DISABLED: Session rental is now manual.",
+              "info"
+            );
           }
         } else if (choice && choice.startsWith("[Rotate]")) {
           const rotated = pool.rotateNext(true);
@@ -2524,6 +3459,8 @@ export default async function (pi: ExtensionAPI) {
               : "Could not rotate to another account.",
             "info"
           );
+        } else if (choice && choice.startsWith("[Stats]")) {
+          ctx.ui.notify(formatStatsSummary(), "info");
         } else if (choice && choice.startsWith("[Status]")) {
           ctx.ui.notify(dashboardTitle, "info");
         } else if (choice && choice.startsWith("[Token]")) {
