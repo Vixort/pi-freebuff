@@ -1428,6 +1428,74 @@ function loadSessionDisk(token: string): SessionCache | null {
   return null;
 }
 
+interface FreebuffSettings {
+  autoSession: boolean;
+  lastUsedModel?: string;
+}
+
+let inMemorySettings: FreebuffSettings | null = null;
+let userExplicitlyStopped = false;
+let lastAutoRentAttemptTime = 0;
+
+function getSettingsDiskPath(): string {
+  return path.join(os.homedir(), ".config", "manicode", "freebuff-settings.json");
+}
+
+function loadFreebuffSettings(): FreebuffSettings {
+  if (inMemorySettings) return inMemorySettings;
+  try {
+    const p = getSettingsDiskPath();
+    if (fs.existsSync(p)) {
+      const data = JSON.parse(fs.readFileSync(p, "utf8"));
+      inMemorySettings = {
+        autoSession: Boolean(data.autoSession),
+        lastUsedModel: typeof data.lastUsedModel === "string" ? data.lastUsedModel : undefined,
+      };
+      return inMemorySettings;
+    }
+  } catch {}
+  inMemorySettings = { autoSession: false };
+  return inMemorySettings;
+}
+
+function saveFreebuffSettings(patch: Partial<FreebuffSettings>): FreebuffSettings {
+  const current = loadFreebuffSettings();
+  const updated: FreebuffSettings = { ...current, ...patch };
+  inMemorySettings = updated;
+  try {
+    const p = getSettingsDiskPath();
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, JSON.stringify(updated, null, 2), { mode: 0o600 });
+  } catch {}
+  return updated;
+}
+
+function isAutoSessionEnabled(): boolean {
+  return loadFreebuffSettings().autoSession;
+}
+
+function setAutoSessionEnabled(enabled: boolean): void {
+  saveFreebuffSettings({ autoSession: enabled });
+}
+
+function getLastUsedModel(): string | null {
+  return loadFreebuffSettings().lastUsedModel || null;
+}
+
+function setLastUsedModel(model: string): void {
+  if (!model || typeof model !== "string") return;
+  const normalized = MODEL_ALIASES[model] || model;
+  saveFreebuffSettings({ lastUsedModel: normalized });
+}
+
+function isUserExplicitlyStopped(): boolean {
+  return userExplicitlyStopped;
+}
+
+function setUserExplicitlyStopped(val: boolean): void {
+  userExplicitlyStopped = val;
+}
+
 class CodebuffClient {
   private currentSession: SessionCache | null = null;
   // Timestamp of last real traffic (ensureSession) — heartbeats back off to
@@ -1510,6 +1578,7 @@ class CodebuffClient {
     } catch {}
     this.currentSession = null;
     saveSessionDisk(this.token, null);
+    setUserExplicitlyStopped(true);
   }
 
   getActiveSession(targetModel?: string): SessionCache | null {
@@ -1538,6 +1607,8 @@ class CodebuffClient {
     // Check if session for requested model is already active
     const active = this.getActiveSession(targetModel);
     if (active && active.instanceId) {
+      setLastUsedModel(active.model);
+      setUserExplicitlyStopped(false);
       const remainingMins = Math.ceil((active.expiresAt - now) / 60000);
       return {
         ok: true,
@@ -1595,6 +1666,8 @@ class CodebuffClient {
       countryBlockReason: data.countryBlockReason || undefined,
     };
     saveSessionDisk(this.token, this.currentSession);
+    setLastUsedModel(this.currentSession.model);
+    setUserExplicitlyStopped(false);
 
     const mins = Math.ceil((expiresAt - now) / 60000);
     return {
@@ -1608,6 +1681,7 @@ class CodebuffClient {
     const targetModel = MODEL_ALIASES[model] || model;
     const active = this.getActiveSession(targetModel);
     if (active && active.instanceId) {
+      setLastUsedModel(active.model);
       return active.instanceId;
     }
 
@@ -1616,6 +1690,21 @@ class CodebuffClient {
       const mins = Math.ceil((anyActive.expiresAt - Date.now()) / 60000);
       throw new Error(
         `Active session is locked to ${prettyModelName(anyActive.model)} (${mins}m remaining). Switch to ${anyActive.model} in pi (/model) or run '/freebuff' to start a session for ${prettyModelName(targetModel)}.`
+      );
+    }
+
+    if (isAutoSessionEnabled()) {
+      setUserExplicitlyStopped(false);
+      console.log(
+        `[Freebuff Auto-Session] No active session for ${prettyModelName(targetModel)}. Auto-renting 1-hour session...`
+      );
+      const res = await this.startSession(targetModel);
+      if (res.ok && res.instanceId) {
+        setLastUsedModel(targetModel);
+        return res.instanceId;
+      }
+      throw new Error(
+        `Auto-Session failed to rent ${prettyModelName(targetModel)}: ${res.message}`
       );
     }
 
@@ -2587,22 +2676,73 @@ export default async function (pi: ExtensionAPI) {
   const address = server.address() as { port: number };
   const proxyBaseUrl = `http://127.0.0.1:${address.port}/v1`;
 
+async function checkAndAutoRenewSession(pool: TokenPool): Promise<void> {
+  if (!isAutoSessionEnabled()) return;
+  if (isUserExplicitlyStopped()) return;
+
+  const entry = pool.peekActive();
+  if (!entry) return;
+
+  const client = entry.client;
+  const activeSession = client.getActiveSession();
+  if (activeSession && activeSession.instanceId) {
+    if (activeSession.model) {
+      setLastUsedModel(activeSession.model);
+    }
+    return;
+  }
+
+  // Session has expired or is null!
+  const now = Date.now();
+  if (now - lastAutoRentAttemptTime < 60_000) {
+    return; // Cooldown 60s
+  }
+
+  const modelToRent = getLastUsedModel() || pool.getLastRequestedModel();
+  if (!modelToRent) return;
+
+  lastAutoRentAttemptTime = now;
+  console.log(
+    `[Freebuff Auto-Session] Active session expired. Automatically renewing 1-hour session for ${prettyModelName(modelToRent)}...`
+  );
+
+  try {
+    const res = await client.startSession(modelToRent);
+    if (res.ok) {
+      setLastUsedModel(modelToRent);
+      console.log(
+        `[Freebuff Auto-Session] Successfully renewed 1-hour session for ${prettyModelName(modelToRent)}!`
+      );
+    } else {
+      console.warn(
+        `[Freebuff Auto-Session] Auto-renewal failed: ${res.message}`
+      );
+    }
+  } catch (err: any) {
+    console.warn(`[Freebuff Auto-Session] Error during auto-renewal: ${err?.message || err}`);
+  }
+}
+
   // Keep-alive heartbeat: the official desktop client pings its active
   // session every ~45s (GET /freebuff/session + x-freebuff-heartbeat) to
-  // prevent mid-conversation expiry. Only the active account's session is
-  // pinged, and only if one exists — idle sessions with no traffic create
-  // no heartbeat traffic at all.
+  // prevent mid-conversation expiry. Also runs auto-session renewal if enabled.
   const HEARTBEAT_INTERVAL_MS = 45_000;
   const heartbeatTimer = setInterval(async () => {
     try {
       const entry = pool.peekActive();
       await entry?.client.heartbeat();
+      await checkAndAutoRenewSession(pool);
     } catch {}
   }, HEARTBEAT_INTERVAL_MS);
   // Don't keep the process alive just for the heartbeat (Node only)
   if (typeof (heartbeatTimer as any)?.unref === "function") {
     (heartbeatTimer as any).unref();
   }
+
+  // Initial check shortly after startup if autoSession is enabled
+  setTimeout(() => {
+    checkAndAutoRenewSession(pool).catch(() => {});
+  }, 4000);
 
   // Stop heartbeat and close server on shutdown (keep cloud sessions intact for their full hour!)
   pi.on("session_shutdown", () => {
@@ -2694,6 +2834,7 @@ export default async function (pi: ExtensionAPI) {
       // 2. Subcommand: /freebuff stop / end / reset
       if (sub === "stop" || sub === "end" || sub === "reset") {
         if (activeClient) {
+          setUserExplicitlyStopped(true);
           await activeClient.deleteSession();
           ctx.ui.notify("Active cloud session released successfully.", "info");
         } else {
@@ -2702,7 +2843,36 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      // 3. Subcommand: /freebuff add <token>
+      // 3. Subcommand: /freebuff auto-session [on/off]
+      if (sub === "auto-session" || sub === "autosession" || sub === "auto") {
+        const action = parts[1]?.toLowerCase();
+        let newState: boolean;
+        if (["on", "enable", "true", "1"].includes(action)) {
+          newState = true;
+        } else if (["off", "disable", "false", "0"].includes(action)) {
+          newState = false;
+        } else {
+          newState = !isAutoSessionEnabled();
+        }
+
+        setAutoSessionEnabled(newState);
+        if (newState) {
+          setUserExplicitlyStopped(false);
+          const lastMdl = getLastUsedModel() || activeClient?.getActiveSession()?.model || "current model";
+          ctx.ui.notify(
+            `Auto-Sessions ENABLED: Freebuff will automatically re-rent a 1-hour session for ${prettyModelName(lastMdl)} when the session expires.`,
+            "info"
+          );
+        } else {
+          ctx.ui.notify(
+            "Auto-Sessions DISABLED: Session rental is now manual via /freebuff.",
+            "info"
+          );
+        }
+        return;
+      }
+
+      // 4. Subcommand: /freebuff add <token>
       if (sub === "add") {
         let tokenToAdd = parts.slice(1).join(" ").trim();
         if (!tokenToAdd && ctx.hasUI) {
@@ -2726,7 +2896,7 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      // 4. Subcommand: /freebuff login
+      // 5. Subcommand: /freebuff login
       if (sub === "login") {
         if (ctx.hasUI) {
           ctx.ui.notify(
@@ -2756,7 +2926,7 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      // 5. Subcommand: /freebuff rotate
+      // 6. Subcommand: /freebuff rotate
       if (sub === "rotate") {
         const rotated = pool.rotateNext(true);
         const newActive = pool.getPoolStatus().find((p) => p.isActive);
@@ -2769,19 +2939,22 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      // 6. Subcommand: /freebuff help
+      // 7. Subcommand: /freebuff help
       if (sub === "help") {
         const helpText = [
           "Freebuff Commands Guide:",
-          "/freebuff             - Open interactive dashboard & session manager",
-          "/freebuff start       - Open model picker to rent a 1-hour session",
-          "/freebuff start <mdl> - Rent 1-hour session (e.g. glm, 0731, solar)",
-          "/freebuff stop        - Release current cloud session",
-          "/freebuff status      - View accounts, Freebucks balance & countdown",
-          "/freebuff login       - Open login link & prompt to paste token",
-          "/freebuff add <token> - Add an auth token to the account pool",
-          "/freebuff rotate      - Switch to next standby account",
-          "/model                - Open pi native model selector",
+          "/freebuff                 - Open interactive dashboard & session manager",
+          "/freebuff start           - Open model picker to rent a 1-hour session",
+          "/freebuff start <mdl>     - Rent 1-hour session (e.g. glm, 0731, solar)",
+          "/freebuff auto-session    - Toggle auto-renewal of expired sessions",
+          "/freebuff auto-session on - Enable auto-renewal using last-used model",
+          "/freebuff auto-session off- Disable auto-renewal (manual rental only)",
+          "/freebuff stop            - Release current cloud session",
+          "/freebuff status          - View accounts, Freebucks balance & countdown",
+          "/freebuff login           - Open login link & prompt to paste token",
+          "/freebuff add <token>     - Add an auth token to the account pool",
+          "/freebuff rotate          - Switch to next standby account",
+          "/model                    - Open pi native model selector",
         ].join("\n");
         ctx.ui.notify(helpText, "info");
         return;
@@ -2812,10 +2985,14 @@ export default async function (pi: ExtensionAPI) {
           const sessionLine = a.activeModel
             ? `${a.activeModel} (${a.remainingMins}m left)`
             : "None (Idle)";
+          const autoLine = isAutoSessionEnabled()
+            ? `Auto-Session: ENABLED (renews ${prettyModelName(getLastUsedModel() || a.activeModel || "last model")})`
+            : "Auto-Session: DISABLED (manual)";
           const lines = [
             `${tag}  ${a.name}  (${a.maskedToken})`,
             `           Freebucks : ${coins} coins  |  ${daily}`,
             `           Session   : ${sessionLine}`,
+            `           Policy    : ${autoLine}`,
             `           Traffic   : ${a.requests} request(s) served`,
           ];
           if (a.countryBlockReason) {
@@ -2852,6 +3029,10 @@ export default async function (pi: ExtensionAPI) {
         if (accounts.length > 1) {
           menuOptions.push("[Rotate] Switch to Next Standby Account");
         }
+        const autoLabel = isAutoSessionEnabled()
+          ? "[Auto-Session] Toggle OFF (Currently: ENABLED)"
+          : "[Auto-Session] Toggle ON (Currently: DISABLED)";
+        menuOptions.push(autoLabel);
         menuOptions.push("[Status] Show Dashboard in Notification");
         menuOptions.push("[Token] Add Auth Token / Login");
         menuOptions.push("Close");
@@ -2889,8 +3070,25 @@ export default async function (pi: ExtensionAPI) {
           }
         } else if (choice && choice.startsWith("[End]")) {
           if (activeClient) {
+            setUserExplicitlyStopped(true);
             await activeClient.deleteSession();
             ctx.ui.notify("Active session released successfully.", "info");
+          }
+        } else if (choice && choice.startsWith("[Auto-Session]")) {
+          const next = !isAutoSessionEnabled();
+          setAutoSessionEnabled(next);
+          if (next) {
+            setUserExplicitlyStopped(false);
+            const lastMdl = getLastUsedModel() || activeAcc?.activeModel || "current model";
+            ctx.ui.notify(
+              `Auto-Sessions ENABLED: Freebuff will automatically re-rent a 1-hour session for ${prettyModelName(lastMdl)} when expired.`,
+              "info"
+            );
+          } else {
+            ctx.ui.notify(
+              "Auto-Sessions DISABLED: Session rental is now manual.",
+              "info"
+            );
           }
         } else if (choice && choice.startsWith("[Rotate]")) {
           const rotated = pool.rotateNext(true);
